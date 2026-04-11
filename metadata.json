@@ -1,0 +1,5 @@
+{
+  "name": "RouteMaster Pro",
+  "description": "Interactive daily route planner for field representatives with map integration and smart checklists.",
+  "requestFramePermissions": ["geolocation"]
+}

@@ -1,0 +1,68 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "Stores user preferences and basic information.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Unique user ID from Firebase Auth" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "homeAddress": { "type": "string" },
+        "startTime": { "type": "string" },
+        "endTime": { "type": "string" },
+        "visitDuration": { "type": "number" },
+        "avoidTolls": { "type": "boolean" },
+        "avoidTraffic": { "type": "boolean" }
+      },
+      "required": ["uid", "email"]
+    },
+    "PlannedRoute": {
+      "title": "Planned Route",
+      "description": "A route planned for a specific date.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "stops": { 
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of store IDs in order"
+        },
+        "startPointId": { "type": "string" },
+        "endPointId": { "type": "string" },
+        "isCompleted": { "type": "boolean" }
+      },
+      "required": ["uid", "date", "stops"]
+    },
+    "RouteHistory": {
+      "title": "Route History",
+      "description": "Historical data for completed routes.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "stops": { "type": "number" },
+        "miles": { "type": "number" },
+        "duration": { "type": "number" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "date", "miles", "duration"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "UserProfile",
+      "description": "User profile and settings"
+    },
+    "/users/{uid}/plannedRoutes/{routeId}": {
+      "schema": "PlannedRoute",
+      "description": "Daily planned routes for a user"
+    },
+    "/users/{uid}/history/{historyId}": {
+      "schema": "RouteHistory",
+      "description": "Completed route history for a user"
+    }
+  }
+}

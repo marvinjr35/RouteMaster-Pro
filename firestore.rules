@@ -1,0 +1,119 @@
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users
+// Document ID: {uid}
+// Fields:
+//   - uid: string (required) - Firebase Auth UID
+//   - email: string (required) - User email
+//   - displayName: string (optional)
+//   - photoURL: string (optional)
+//   - homeAddress: string (optional)
+//   - startTime: string (optional)
+//   - endTime: string (optional)
+//   - visitDuration: number (optional)
+//   - avoidTolls: boolean (optional)
+//   - avoidTraffic: boolean (optional)
+//
+// Collection: users/{uid}/plannedRoutes
+// Document ID: {routeId}
+// Fields:
+//   - uid: string (required)
+//   - date: string (required) - YYYY-MM-DD
+//   - stops: list (required) - Array of store IDs
+//   - startPointId: string (optional)
+//   - endPointId: string (optional)
+//   - isCompleted: boolean (optional)
+//
+// Collection: users/{uid}/history
+// Document ID: {historyId}
+// Fields:
+//   - uid: string (required)
+//   - date: string (required)
+//   - stops: number (required)
+//   - miles: number (required)
+//   - duration: number (required)
+//   - timestamp: timestamp (required)
+//
+// ===============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidDate(date) {
+      return date is string && date.matches("^\\d{4}-\\d{2}-\\d{2}$");
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email']) &&
+             data.uid == request.auth.uid &&
+             isValidEmail(data.email) &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() < 100)) &&
+             (!('startTime' in data) || (data.startTime is string && data.startTime.matches("^\\d{2}:\\d{2}$"))) &&
+             (!('endTime' in data) || (data.endTime is string && data.endTime.matches("^\\d{2}:\\d{2}$"))) &&
+             (!('visitDuration' in data) || (data.visitDuration is number && data.visitDuration > 0));
+    }
+
+    function isValidPlannedRoute(data) {
+      return data.keys().hasAll(['uid', 'date', 'stops']) &&
+             data.uid == request.auth.uid &&
+             isValidDate(data.date) &&
+             data.stops is list && data.stops.size() < 50;
+    }
+
+    function isValidHistory(data) {
+      return data.keys().hasAll(['uid', 'date', 'stops', 'miles', 'duration', 'timestamp']) &&
+             data.uid == request.auth.uid &&
+             data.stops is number &&
+             data.miles is number &&
+             data.duration is number &&
+             data.timestamp is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data);
+
+      match /plannedRoutes/{routeId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidPlannedRoute(request.resource.data);
+        allow update: if isOwner(userId) && isValidPlannedRoute(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+
+      match /history/{historyId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidHistory(request.resource.data);
+        allow update: if isOwner(userId) && isValidHistory(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+    }
+  }
+}
