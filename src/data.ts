@@ -10,6 +10,7 @@ export interface Location {
   hours?: string;
   phone?: string;
   notes?: string;
+  visitDuration?: number;
 }
 
 export const locations: Location[] = [

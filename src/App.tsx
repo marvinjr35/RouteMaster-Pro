@@ -381,7 +381,7 @@ export default function App() {
   const [routeStats, setRouteStats] = useState<{ distance: number; duration: number }[]>([]);
   const [isOptimizing, setIsOptimizing] = useState(false);
   const [showOnlyClosest, setShowOnlyClosest] = useState(true);
-  const [activeTab, setActiveTab] = useState<'PLANNER' | 'VISITED' | 'HISTORY' | 'ANALYTICS'>('PLANNER');
+  const [activeTab, setActiveTab] = useState<'PLANNER' | 'VISITED' | 'HISTORY' | 'ANALYTICS' | 'CALENDAR'>('PLANNER');
   const [visitedStoreIds, setVisitedStoreIds] = useState<Set<string>>(new Set());
   const [routeHistory, setRouteHistory] = useState<any[]>([]);
   const [isTracking, setIsTracking] = useState(false);
@@ -400,6 +400,274 @@ export default function App() {
   const [assignDate, setAssignDate] = useState(selectedDate);
   const [isRouteConfirmed, setIsRouteConfirmed] = useState(false);
   const [expandedCluster, setExpandedCluster] = useState<string | null>(null);
+  const [showCalendar, setShowCalendar] = useState(false);
+
+  const workingDays = useMemo(() => {
+    const days = [];
+    let curr = new Date('2026-04-11');
+    const end = new Date('2026-05-29');
+    
+    while (curr <= end) {
+      const day = curr.getDay();
+      const dateStr = curr.toISOString().split('T')[0];
+      
+      // April 11 (Sat) and 12 (Sun) are exceptions
+      if (dateStr === '2026-04-11' || dateStr === '2026-04-12') {
+        days.push(dateStr);
+      } else if (day >= 1 && day <= 4) {
+        // Mon-Thu
+        days.push(dateStr);
+      }
+      curr.setDate(curr.getDate() + 1);
+    }
+    return days;
+  }, []);
+
+  const [allPlannedRoutes, setAllPlannedRoutes] = useState<Record<string, any>>({});
+
+  // Fetch all planned routes for the calendar
+  useEffect(() => {
+    if (!user || !isAuthReady) return;
+
+    const q = query(
+      collection(db, `users/${user.uid}/plannedRoutes`)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const routes: Record<string, any> = {};
+      snapshot.docs.forEach(doc => {
+        const data = doc.data();
+        routes[data.date] = { id: doc.id, ...data };
+      });
+      setAllPlannedRoutes(routes);
+    }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/plannedRoutes`));
+
+    return () => unsubscribe();
+  }, [user, isAuthReady]);
+
+  const autoSchedule = async () => {
+    if (!user) return;
+    setIsOptimizing(true);
+    
+    try {
+      const unvisited = [...locations];
+      const schedule: Record<string, Location[]> = {};
+      let currentPos = HOME_LOCATION;
+      
+      for (const date of workingDays) {
+        const dayRoute: Location[] = [];
+        let currentTime = 10 * 60; // 10:00 AM in minutes
+        const endTimeMinutes = 18 * 60; // 6:00 PM
+        
+        // Is it a weekend? (Only April 11/12)
+        const isWeekend = date === '2026-04-11' || date === '2026-04-12';
+        
+        while (unvisited.length > 0) {
+          // Find closest store
+          // Respect T-Mobile constraint: No T-Mobile on Fri-Sun (except 11/12)
+          // Since we only work Mon-Thu + 11/12, this is mostly handled by workingDays
+          // but let's be explicit if we ever add more days.
+          
+          const candidates = unvisited.filter(loc => {
+            if (loc.carrier === 'T-MOBILE') {
+              const d = new Date(date + 'T12:00:00');
+              const day = d.getDay();
+              if ((day === 0 || day === 5 || day === 6) && !isWeekend) return false;
+            }
+            return true;
+          });
+          
+          if (candidates.length === 0) break;
+          
+          // Simple greedy: closest to currentPos
+          candidates.sort((a, b) => {
+            const distA = Math.sqrt(Math.pow(a.lat - currentPos.lat, 2) + Math.pow(a.lng - currentPos.lng, 2));
+            const distB = Math.sqrt(Math.pow(b.lat - currentPos.lat, 2) + Math.pow(b.lng - currentPos.lng, 2));
+            return distA - distB;
+          });
+          
+          const next = candidates[0];
+          
+          // Estimate travel + visit time (approx 15m travel + 45m visit)
+          const estimatedTime = 60; 
+          
+          if (currentTime + estimatedTime > endTimeMinutes) break;
+          
+          dayRoute.push(next);
+          unvisited.splice(unvisited.indexOf(next), 1);
+          currentTime += estimatedTime;
+          currentPos = next;
+        }
+        
+        if (dayRoute.length > 0) {
+          schedule[date] = dayRoute;
+          // Save to Firestore
+          const routeData = {
+            uid: user.uid,
+            date: date,
+            stops: dayRoute.map(s => s.id),
+            startPointId: 'HOME',
+            endPointId: 'HOME',
+            isConfirmed: true,
+            updatedAt: serverTimestamp()
+          };
+          
+          const q = query(
+            collection(db, `users/${user.uid}/plannedRoutes`),
+            where('date', '==', date)
+          );
+          const snap = await getDocs(q);
+          if (snap.empty) {
+            await addDoc(collection(db, `users/${user.uid}/plannedRoutes`), routeData);
+          } else {
+            await setDoc(doc(db, `users/${user.uid}/plannedRoutes`, snap.docs[0].id), routeData, { merge: true });
+          }
+        }
+        
+        currentPos = HOME_LOCATION; // Reset to home for next day
+        if (unvisited.length === 0) break;
+      }
+      
+      alert(`Successfully scheduled ${locations.length - unvisited.length} stores across ${Object.keys(schedule).length} days.`);
+    } catch (err) {
+      console.error(err);
+      alert("Error during auto-scheduling.");
+    } finally {
+      setIsOptimizing(false);
+    }
+  };
+
+  const CalendarView = () => {
+    const months = [
+      { name: 'April 2026', month: 3, year: 2026 },
+      { name: 'May 2026', month: 4, year: 2026 }
+    ];
+
+    return (
+      <div className="p-8 h-full overflow-y-auto custom-scrollbar bg-white">
+        <div className="max-w-5xl mx-auto">
+          <div className="flex items-center justify-between mb-8">
+            <div>
+              <h2 className="text-3xl font-black text-neutral-900 tracking-tight">Visit Calendar</h2>
+              <p className="text-neutral-500 font-medium">April 11 - May 29, 2026 • Washington Market</p>
+            </div>
+            <div className="flex gap-3">
+              <button 
+                onClick={autoSchedule}
+                disabled={isOptimizing}
+                className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl font-bold shadow-lg shadow-blue-200 transition-all flex items-center gap-2 disabled:opacity-50"
+              >
+                {isOptimizing ? <Sparkles className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                Auto-Schedule All Stores
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-12">
+            {months.map(({ name, month, year }) => {
+              const firstDay = new Date(year, month, 1).getDay();
+              const daysInMonth = new Date(year, month + 1, 0).getDate();
+              const days = Array.from({ length: daysInMonth }, (_, i) => i + 1);
+              const padding = Array.from({ length: firstDay }, (_, i) => null);
+
+              return (
+                <div key={name} className="space-y-4">
+                  <h3 className="text-xl font-bold text-neutral-800 px-2">{name}</h3>
+                  <div className="grid grid-cols-7 gap-2">
+                    {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => (
+                      <div key={d} className="text-center text-[10px] font-black text-neutral-400 uppercase tracking-widest py-2">
+                        {d}
+                      </div>
+                    ))}
+                    {[...padding, ...days].map((day, i) => {
+                      if (day === null) return <div key={`pad-${i}`} />;
+                      
+                      const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                      const isWorking = workingDays.includes(dateStr);
+                      const route = allPlannedRoutes[dateStr];
+                      const isSelected = selectedDate === dateStr;
+
+                      return (
+                        <div 
+                          key={dateStr}
+                          onClick={() => {
+                            setSelectedDate(dateStr);
+                            if (isWorking) setActiveTab('PLANNER');
+                          }}
+                          className={cn(
+                            "aspect-square rounded-2xl border-2 flex flex-col items-center justify-center gap-1 transition-all cursor-pointer relative group",
+                            isSelected ? "border-blue-600 bg-blue-50 shadow-md scale-105 z-10" : "border-transparent hover:border-neutral-200",
+                            !isWorking && "opacity-30 grayscale cursor-not-allowed",
+                            isWorking && !route && "bg-neutral-50",
+                            route && "bg-blue-600 text-white border-blue-600"
+                          )}
+                        >
+                          <span className={cn("text-sm font-bold", route ? "text-white" : "text-neutral-700")}>{day}</span>
+                          {route && (
+                            <div className="flex flex-col items-center">
+                              <span className="text-[8px] font-black uppercase opacity-80">{route.stops.length} Stores</span>
+                              <div className="flex gap-0.5 mt-0.5">
+                                {route.stops.slice(0, 3).map((_: any, idx: number) => (
+                                  <div key={idx} className="w-1 h-1 rounded-full bg-white/60" />
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          {isSelected && (
+                            <motion.div 
+                              layoutId="active-day"
+                              className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-1 h-1 bg-blue-600 rounded-full"
+                            />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-12 p-8 bg-neutral-900 rounded-[32px] text-white overflow-hidden relative">
+            <div className="relative z-10">
+              <h4 className="text-xl font-bold mb-2">Schedule Overview</h4>
+              <p className="text-neutral-400 text-sm mb-6">Summary of your Washington market store visits.</p>
+              
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
+                <div className="p-4 bg-white/5 rounded-2xl border border-white/10">
+                  <p className="text-[10px] font-black text-neutral-500 uppercase tracking-widest mb-1">Total Stores</p>
+                  <p className="text-2xl font-bold">{locations.length}</p>
+                </div>
+                <div className="p-4 bg-white/5 rounded-2xl border border-white/10">
+                  <p className="text-[10px] font-black text-neutral-500 uppercase tracking-widest mb-1">Scheduled</p>
+                  <p className="text-2xl font-bold text-blue-400">
+                    {Object.values(allPlannedRoutes).reduce((acc: number, r: any) => acc + (r.stops?.length || 0), 0)}
+                  </p>
+                </div>
+                <div className="p-4 bg-white/5 rounded-2xl border border-white/10">
+                  <p className="text-[10px] font-black text-neutral-500 uppercase tracking-widest mb-1">Working Days</p>
+                  <p className="text-2xl font-bold">{workingDays.length}</p>
+                </div>
+                <div className="p-4 bg-white/5 rounded-2xl border border-white/10">
+                  <p className="text-[10px] font-black text-neutral-500 uppercase tracking-widest mb-1">Avg Stops/Day</p>
+                  <p className="text-2xl font-bold">
+                    {(() => {
+                      const routesArray = Object.values(allPlannedRoutes) as any[];
+                      const total = routesArray.reduce((acc: number, r: any) => acc + (Number(r?.stops?.length) || 0), 0);
+                      const daysCount = Number(workingDays.length);
+                      const avg = daysCount > 0 ? total / daysCount : 0;
+                      return avg.toFixed(1);
+                    })()}
+                  </p>
+                </div>
+              </div>
+            </div>
+            <div className="absolute top-0 right-0 w-64 h-64 bg-blue-600/20 blur-[100px] rounded-full -mr-32 -mt-32" />
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   // Clustering logic: Group by City/Area
   const clusters = useMemo(() => {
@@ -500,7 +768,7 @@ export default function App() {
     }
   };
 
-  const fetchRoute = async () => {
+  const fetchRoute = async (skipNav = false) => {
     if (plannedRoute.length < 1) return;
     
     const fullRoute = [startPoint, ...plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint];
@@ -527,7 +795,9 @@ export default function App() {
         }));
         setRouteStats(stats);
 
-        setIsNavigating(true);
+        if (!skipNav) {
+          setIsNavigating(true);
+        }
       }
     } catch (error) {
       console.error('Error fetching route:', error);
@@ -538,7 +808,6 @@ export default function App() {
     const [startH, startM] = startTime.split(':').map(Number);
     const [endH, endM] = endTime.split(':').map(Number);
     
-    const visitDurationSec = visitDuration * 60;
     const fullRoute = [startPoint, ...plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint].filter(Boolean);
     
     let totalSeconds = 0;
@@ -549,10 +818,9 @@ export default function App() {
       if (!currentStop) continue;
 
       // If the stop we are leaving (i) is NOT home, we spend time there BEFORE leaving
-      // This applies to the start point (i=0) if it's a store, 
-      // and all subsequent middle stops (i > 0)
       if (currentStop.id !== 'HOME') {
-        totalSeconds += visitDurationSec;
+        const duration = (currentStop.visitDuration || visitDuration) * 60;
+        totalSeconds += duration;
       }
 
       // Add travel time for the leg leading to stop i+1
@@ -566,7 +834,8 @@ export default function App() {
     const arrivalTime = new Date(start.getTime() + totalSeconds * 1000);
     
     // Departure time is arrival time + visit duration (if not Home)
-    const departureTime = new Date(arrivalTime.getTime() + (fullRoute[index]?.id !== 'HOME' ? visitDurationSec : 0));
+    const currentVisitDuration = (fullRoute[index]?.visitDuration || visitDuration) * 60;
+    const departureTime = new Date(arrivalTime.getTime() + (fullRoute[index]?.id !== 'HOME' ? currentVisitDuration : 0));
     
     const end = new Date();
     end.setHours(endH, endM, 0);
@@ -626,9 +895,19 @@ export default function App() {
   }, [showGasStations]);
 
   const addToRoute = async (location: Location) => {
-    if (!plannedRoute.find(l => l?.id === location.id)) {
+    if (plannedRoute.find(l => l?.id === location.id)) {
+      // If already in route, remove it (unselect)
+      const newRoute = plannedRoute.filter(l => l?.id !== location.id);
+      setPlannedRoute(newRoute);
+      if (selectedLocation?.id === location.id) {
+        setSelectedLocation(null);
+      }
+      if (user) await savePlannedRoute(newRoute, startPoint, endPoint);
+    } else {
+      // If not in route, add it (select)
       const newRoute = [...plannedRoute, location];
       setPlannedRoute(newRoute);
+      setSelectedLocation(location);
       if (user) await savePlannedRoute(newRoute, startPoint, endPoint);
     }
   };
@@ -637,6 +916,20 @@ export default function App() {
     const newRoute = plannedRoute.filter(l => l?.id !== id);
     setPlannedRoute(newRoute);
     if (user) await savePlannedRoute(newRoute, startPoint, endPoint);
+  };
+
+  const updateLocationDuration = (id: string, duration: number) => {
+    const newRoute = plannedRoute.map(l => {
+      if (l.id === id) {
+        return { ...l, visitDuration: duration };
+      }
+      return l;
+    });
+    setPlannedRoute(newRoute);
+    
+    // Also update start/end points if they match
+    if (startPoint?.id === id) setStartPoint({ ...startPoint, visitDuration: duration });
+    if (endPoint?.id === id) setEndPoint({ ...endPoint, visitDuration: duration });
   };
 
   const isPlanned = (id: string) => plannedRoute.some(l => l?.id === id);
@@ -750,6 +1043,13 @@ export default function App() {
                 </button>
               )}
               <div className="flex bg-neutral-100 p-1 rounded-xl">
+                <button 
+                  onClick={() => setActiveTab('CALENDAR')}
+                  className={cn("p-2 rounded-lg transition-all", activeTab === 'CALENDAR' ? "bg-white shadow-sm text-blue-600" : "text-neutral-400")}
+                  title="Calendar View"
+                >
+                  <Calendar className="w-4 h-4" />
+                </button>
                 <button 
                   onClick={() => setActiveTab('PLANNER')}
                   className={cn("p-2 rounded-lg transition-all", activeTab === 'PLANNER' ? "bg-white shadow-sm text-blue-600" : "text-neutral-400")}
@@ -1232,7 +1532,7 @@ export default function App() {
         </div>
 
         {/* Planned Route Summary */}
-        <div className="p-6 bg-neutral-900 text-white shrink-0">
+        <div className="h-[250px] p-6 bg-neutral-900 text-white shrink-0">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
               <Calendar className="w-5 h-5 text-blue-400" />
@@ -1313,6 +1613,17 @@ export default function App() {
                   <p className="text-[10px] text-neutral-500">{calculateETA(0).departure} Departure</p>
                 </div>
                 {startPoint?.id !== 'HOME' && (
+                  <div className="flex items-center gap-1 bg-neutral-100 px-2 py-1 rounded-lg">
+                    <input 
+                      type="number" 
+                      value={startPoint.visitDuration || visitDuration} 
+                      onChange={(e) => updateLocationDuration(startPoint.id, parseInt(e.target.value) || 0)}
+                      className="w-8 bg-transparent text-[10px] font-bold text-center outline-none"
+                    />
+                    <span className="text-[8px] font-bold text-neutral-400 uppercase">min</span>
+                  </div>
+                )}
+                {startPoint?.id !== 'HOME' && (
                   <button onClick={() => setStartPoint(HOME_LOCATION as Location)} className="text-[10px] text-blue-600 font-bold hover:underline">Reset</button>
                 )}
               </motion.div>
@@ -1351,6 +1662,15 @@ export default function App() {
                           <span>Dep: {calculateETA(index + 1).departure}</span>
                         </div>
                       </div>
+                    </div>
+                    <div className="flex items-center gap-1 bg-neutral-100 px-2 py-1 rounded-lg">
+                      <input 
+                        type="number" 
+                        value={loc.visitDuration || visitDuration} 
+                        onChange={(e) => updateLocationDuration(loc.id, parseInt(e.target.value) || 0)}
+                        className="w-8 bg-transparent text-[10px] font-bold text-center outline-none"
+                      />
+                      <span className="text-[8px] font-bold text-neutral-400 uppercase">min</span>
                     </div>
                     <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
                       <button 
@@ -1416,6 +1736,17 @@ export default function App() {
                         Arrival: {calculateETA(plannedRoute.length + 1).arrival}
                       </p>
                     </div>
+                    {endPoint?.id !== 'HOME' && (
+                      <div className="flex items-center gap-1 bg-neutral-100 px-2 py-1 rounded-lg">
+                        <input 
+                          type="number" 
+                          value={endPoint.visitDuration || visitDuration} 
+                          onChange={(e) => updateLocationDuration(endPoint.id, parseInt(e.target.value) || 0)}
+                          className="w-8 bg-transparent text-[10px] font-bold text-center outline-none"
+                        />
+                        <span className="text-[8px] font-bold text-neutral-400 uppercase">min</span>
+                      </div>
+                    )}
                     {endPoint?.id !== 'HOME' && (
                       <button onClick={() => setEndPoint(HOME_LOCATION as Location)} className="text-[10px] text-blue-600 font-bold hover:underline">Reset</button>
                     )}
@@ -1497,7 +1828,10 @@ export default function App() {
 
       {/* Map Area */}
       <div className="flex-1 relative">
-        <MapContainer 
+        {activeTab === 'CALENDAR' ? (
+          <CalendarView />
+        ) : (
+          <MapContainer 
           center={centerPosition} 
           zoom={12} 
           className="h-full w-full"
@@ -1582,6 +1916,7 @@ export default function App() {
             />
           )}
         </MapContainer>
+        )}
 
         {/* Floating Controls */}
         <div className="absolute top-6 right-6 flex flex-col gap-2 z-[1000]">
@@ -1664,17 +1999,42 @@ export default function App() {
                         <p className="text-[9px] text-blue-600 font-bold">Dep: {calculateETA(0).departure}</p>
                       </div>
                     </div>
-                    {plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, i) => (
-                      <div key={loc.id} className="flex items-center gap-3 p-2 bg-neutral-50 rounded-xl">
-                        <div className="w-5 h-5 rounded-full bg-neutral-200 flex items-center justify-center text-[10px] font-bold text-neutral-600">{i + 2}</div>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-xs font-medium truncate">{loc.address}</p>
-                          <p className="text-[9px] text-neutral-500">
-                            Arr: {calculateETA(i + 1).arrival} • Dep: {calculateETA(i + 1).departure}
-                          </p>
+                    {plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, i) => {
+                      const originalIndex = plannedRoute.findIndex(l => l.id === loc.id);
+                      return (
+                        <div key={loc.id} className="flex items-center gap-3 p-2 bg-neutral-50 rounded-xl group">
+                          <div className="w-5 h-5 rounded-full bg-neutral-200 flex items-center justify-center text-[10px] font-bold text-neutral-600">{i + 2}</div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs font-medium truncate">{loc.address}</p>
+                            <p className="text-[9px] text-neutral-500">
+                              Arr: {calculateETA(i + 1).arrival} • Dep: {calculateETA(i + 1).departure}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
+                            <button 
+                              onClick={async () => {
+                                await moveInRoute(originalIndex, 'up');
+                                await fetchRoute(true);
+                              }}
+                              disabled={i === 0}
+                              className="p-1 text-neutral-400 hover:text-blue-500 disabled:opacity-30"
+                            >
+                              <ChevronUp className="w-3 h-3" />
+                            </button>
+                            <button 
+                              onClick={async () => {
+                                await moveInRoute(originalIndex, 'down');
+                                await fetchRoute(true);
+                              }}
+                              disabled={i === plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id).length - 1}
+                              className="p-1 text-neutral-400 hover:text-blue-500 disabled:opacity-30"
+                            >
+                              <ChevronDown className="w-3 h-3" />
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                     <div className="flex items-center gap-3 p-2 bg-blue-50 rounded-xl">
                       <div className="w-5 h-5 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white">{plannedRoute.length + 2}</div>
                       <div className="flex-1 min-w-0">
