@@ -21,6 +21,8 @@ import {
   Plus, 
   Trash2, 
   ChevronRight,
+  ChevronUp,
+  ChevronDown,
   Search,
   Filter,
   Clock,
@@ -45,44 +47,53 @@ L.Icon.Default.mergeOptions({
 });
 
 // Custom marker icons
-const createMarkerIcon = (color: string, isPlanned: boolean) => {
+const createMarkerIcon = (color: string, isPlanned: boolean, number?: number, isSelected?: boolean) => {
+  const size = isSelected ? 40 : 30;
+  const innerSize = isSelected ? 14 : 10;
+  
   return L.divIcon({
     className: 'custom-div-icon',
     html: `<div style="
       background-color: ${color};
-      width: 30px;
-      height: 30px;
+      width: ${size}px;
+      height: ${size}px;
       border-radius: 50% 50% 50% 0;
       transform: rotate(-45deg);
       display: flex;
       align-items: center;
       justify-content: center;
-      border: 2px solid white;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.3);
-      opacity: ${isPlanned ? 0.4 : 1};
+      border: ${isSelected ? '3px' : '2px'} solid white;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.4);
+      opacity: ${isPlanned && !isSelected ? 0.6 : 1};
+      transition: all 0.3s ease;
+      z-index: ${isSelected ? 1000 : 1};
     ">
       <div style="
-        width: 10px;
-        height: 10px;
+        width: ${innerSize}px;
+        height: ${innerSize}px;
         background: white;
         border-radius: 50%;
         transform: rotate(45deg);
-      "></div>
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: ${isSelected ? '10px' : '8px'};
+        font-weight: bold;
+        color: ${color};
+      ">
+        ${number !== undefined ? number : ''}
+      </div>
     </div>`,
-    iconSize: [30, 30],
-    iconAnchor: [15, 30],
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size],
   });
 };
 
-const plannedIcon = createMarkerIcon('#3b82f6', true);
-const defaultIcon = createMarkerIcon('#ef4444', false);
-const activeIcon = createMarkerIcon('#10b981', false);
-
-function MapUpdater({ center }: { center: [number, number] }) {
+function MapUpdater({ center, zoom }: { center: [number, number], zoom?: number }) {
   const map = useMap();
   useEffect(() => {
-    map.setView(center, 12);
-  }, [center, map]);
+    map.setView(center, zoom || 12, { animate: true });
+  }, [center, zoom, map]);
   return null;
 }
 
@@ -123,6 +134,10 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [selectedDate, setSelectedDate] = useState('2026-04-11');
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showTrafficLayer, setShowTrafficLayer] = useState(false);
+  const [trafficAlerts, setTrafficAlerts] = useState<string[]>([]);
+  const [trafficMultiplier, setTrafficMultiplier] = useState(1.0);
 
   // Auth Listener
   useEffect(() => {
@@ -147,6 +162,7 @@ export default function App() {
         const data = snapshot.docs[0].data();
         const stops = data.stops.map((id: string) => locations.find(l => l.id === id)).filter(Boolean);
         setPlannedRoute(stops);
+        setIsRouteConfirmed(data.isConfirmed || false);
         if (data.startPointId) {
           const sp = locations.find(l => l.id === data.startPointId) || HOME_LOCATION;
           setStartPoint(sp as Location);
@@ -157,6 +173,7 @@ export default function App() {
         }
       } else {
         setPlannedRoute([]);
+        setIsRouteConfirmed(false);
         setStartPoint(HOME_LOCATION as Location);
         setEndPoint(HOME_LOCATION as Location);
       }
@@ -178,20 +195,93 @@ export default function App() {
     return () => unsubscribe();
   }, [user, isAuthReady]);
 
-  const savePlannedRoute = async (stops: Location[], sp: Location, ep: Location) => {
+  // Firestore Sync: Visited Stores (Checked off)
+  useEffect(() => {
+    if (!user || !isAuthReady) return;
+
+    const q = query(
+      collection(db, `users/${user.uid}/plannedRoutes`),
+      where('isConfirmed', '==', true)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const ids = new Set<string>();
+      snapshot.docs.forEach(doc => {
+        const data = doc.data();
+        if (data.stops) {
+          data.stops.forEach((id: string) => ids.add(id));
+        }
+        // Also include start/end points if they are stores
+        if (data.startPointId && data.startPointId !== 'HOME') ids.add(data.startPointId);
+        if (data.endPointId && data.endPointId !== 'HOME') ids.add(data.endPointId);
+      });
+      setVisitedStoreIds(ids);
+    }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/plannedRoutes`));
+
+    return () => unsubscribe();
+  }, [user, isAuthReady]);
+
+  const confirmRoute = async () => {
+    if (user) {
+      try {
+        const targetDate = assignDate || selectedDate;
+        const routeData = {
+          uid: user.uid,
+          date: targetDate,
+          stops: plannedRoute.map(s => s?.id).filter(Boolean),
+          startPointId: startPoint?.id,
+          endPointId: endPoint?.id,
+          isConfirmed: true,
+          updatedAt: serverTimestamp()
+        };
+
+        const q = query(
+          collection(db, `users/${user.uid}/plannedRoutes`),
+          where('date', '==', targetDate)
+        );
+        const snapshot = await getDocs(q);
+
+        if (snapshot.empty) {
+          await addDoc(collection(db, `users/${user.uid}/plannedRoutes`), routeData);
+        } else {
+          await setDoc(doc(db, `users/${user.uid}/plannedRoutes`, snapshot.docs[0].id), routeData, { merge: true });
+        }
+
+        if (assignDate !== selectedDate) {
+          // Delete from current date if we moved it
+          const qOld = query(
+            collection(db, `users/${user.uid}/plannedRoutes`),
+            where('date', '==', selectedDate)
+          );
+          const snapshotOld = await getDocs(qOld);
+          if (!snapshotOld.empty && snapshotOld.docs[0].id !== snapshot.docs[0]?.id) {
+            await deleteDoc(doc(db, `users/${user.uid}/plannedRoutes`, snapshotOld.docs[0].id));
+          }
+          setSelectedDate(assignDate);
+        }
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}/plannedRoutes`);
+      }
+    }
+    setShowReviewModal(false);
+  };
+
+  const savePlannedRoute = async (stops: Location[], sp: Location, ep: Location, dateOverride?: string) => {
     if (!user) return;
+    const targetDate = dateOverride || selectedDate;
     try {
       const q = query(
         collection(db, `users/${user.uid}/plannedRoutes`),
-        where('date', '==', selectedDate)
+        where('date', '==', targetDate)
       );
       const snapshot = await getDocs(q);
       const routeData = {
         uid: user.uid,
-        date: selectedDate,
-        stops: stops.map(s => s.id),
-        startPointId: sp.id,
-        endPointId: ep.id,
+        date: targetDate,
+        stops: stops.map(s => s?.id).filter(Boolean),
+        startPointId: sp?.id,
+        endPointId: ep?.id,
+        isConfirmed: false,
         updatedAt: serverTimestamp()
       };
 
@@ -219,8 +309,9 @@ export default function App() {
       Available Stores: ${locations.length}
       User Home: 1564 41st St SE, Washington, DC
       Working Hours: ${startTime} - ${endTime}
+      Traffic Layer Enabled: ${showTrafficLayer}
       
-      Provide helpful, concise advice on routing, traffic, and store clusters. Use Google Search and Maps data when needed.`;
+      Provide helpful, concise advice on routing, traffic, and store clusters. Use Google Search and Maps data when needed. If the user asks about traffic, use Google Maps grounding to get real-time data for the DC/Washington area.`;
 
       const response = await geminiFlash(chatInput, systemPrompt);
       setChatMessages(prev => [...prev, { role: 'model', text: response.text || 'I am sorry, I could not process that.' }]);
@@ -230,6 +321,54 @@ export default function App() {
     } finally {
       setIsChatLoading(false);
     }
+  };
+
+  const fetchTrafficData = async () => {
+    try {
+      const prompt = "What are the current traffic conditions and any major accidents or delays in the Washington DC and surrounding Maryland/Virginia areas right now? Provide a concise summary of major bottlenecks. Also, provide a single number representing the overall traffic delay multiplier (e.g., 1.0 for normal, 1.5 for heavy traffic). Format: Alerts: [list] Multiplier: [number]";
+      const response = await geminiFlash(prompt, "You are a traffic reporter for the Washington DC area. Provide concise alerts and a numeric multiplier.");
+      const text = response.text || "";
+      const alertsMatch = text.match(/Alerts:([\s\S]*?)Multiplier:/i);
+      const multiplierMatch = text.match(/Multiplier:\s*([\d.]+)/i);
+      
+      if (alertsMatch) {
+        const alerts = alertsMatch[1].split('\n').filter(line => line.trim().length > 10).slice(0, 3);
+        setTrafficAlerts(alerts);
+      }
+      if (multiplierMatch) {
+        setTrafficMultiplier(parseFloat(multiplierMatch[1]) || 1.0);
+      }
+    } catch (error) {
+      console.error("Traffic fetch error:", error);
+    }
+  };
+
+  useEffect(() => {
+    if (showTrafficLayer) {
+      fetchTrafficData();
+      const interval = setInterval(fetchTrafficData, 300000); // Every 5 mins
+      return () => clearInterval(interval);
+    }
+  }, [showTrafficLayer]);
+
+  const toggleSelection = (id: string) => {
+    const newSelection = new Set(selectedIds);
+    if (newSelection.has(id)) {
+      newSelection.delete(id);
+    } else {
+      newSelection.add(id);
+    }
+    setSelectedIds(newSelection);
+  };
+
+  const addSelectedToRoute = async () => {
+    const selectedLocs = locations.filter(l => selectedIds.has(l.id) && !plannedRoute.some(p => p?.id === l.id));
+    if (selectedLocs.length === 0) return;
+    
+    const newRoute = [...plannedRoute, ...selectedLocs];
+    setPlannedRoute(newRoute);
+    setSelectedIds(new Set());
+    if (user) await savePlannedRoute(newRoute, startPoint, endPoint);
   };
 
   const [plannedRoute, setPlannedRoute] = useState<Location[]>([]);
@@ -242,7 +381,8 @@ export default function App() {
   const [routeStats, setRouteStats] = useState<{ distance: number; duration: number }[]>([]);
   const [isOptimizing, setIsOptimizing] = useState(false);
   const [showOnlyClosest, setShowOnlyClosest] = useState(true);
-  const [activeTab, setActiveTab] = useState<'PLANNER' | 'HISTORY' | 'ANALYTICS'>('PLANNER');
+  const [activeTab, setActiveTab] = useState<'PLANNER' | 'VISITED' | 'HISTORY' | 'ANALYTICS'>('PLANNER');
+  const [visitedStoreIds, setVisitedStoreIds] = useState<Set<string>>(new Set());
   const [routeHistory, setRouteHistory] = useState<any[]>([]);
   const [isTracking, setIsTracking] = useState(false);
   const [trackingStartTime, setTrackingStartTime] = useState<number | null>(null);
@@ -256,6 +396,10 @@ export default function App() {
   const [showGasStations, setShowGasStations] = useState(false);
   const [gasStations, setGasStations] = useState<any[]>([]);
   const [isLoadingGas, setIsLoadingGas] = useState(false);
+  const [showReviewModal, setShowReviewModal] = useState(false);
+  const [assignDate, setAssignDate] = useState(selectedDate);
+  const [isRouteConfirmed, setIsRouteConfirmed] = useState(false);
+  const [expandedCluster, setExpandedCluster] = useState<string | null>(null);
 
   // Clustering logic: Group by City/Area
   const clusters = useMemo(() => {
@@ -293,6 +437,10 @@ export default function App() {
     const isExceptionDate = selectedDate === '2026-04-11' || selectedDate === '2026-04-12';
 
     return sortedLocations.filter((loc, index) => {
+      if (!loc) return false;
+      // Filter out stores already part of a confirmed route
+      if (visitedStoreIds.has(loc.id)) return false;
+
       // Closest 62 stores requirement
       if (showOnlyClosest && index >= 62) return false;
 
@@ -305,14 +453,18 @@ export default function App() {
       const matchesCarrier = filterCarrier === 'ALL' || loc.carrier === filterCarrier;
       return matchesSearch && matchesCarrier;
     });
-  }, [searchQuery, filterCarrier, selectedDate, showOnlyClosest, sortedLocations]);
+  }, [searchQuery, filterCarrier, selectedDate, showOnlyClosest, sortedLocations, visitedStoreIds]);
+
+  const visitedLocations = useMemo(() => {
+    return locations.filter(loc => visitedStoreIds.has(loc.id));
+  }, [locations, visitedStoreIds]);
 
   const optimizeRoute = async () => {
     if (plannedRoute.length < 1) return;
     setIsOptimizing(true);
     
     // Use selected start and end points
-    const fullRoute = [startPoint, ...plannedRoute.filter(l => l.id !== startPoint.id && l.id !== endPoint.id), endPoint];
+    const fullRoute = [startPoint, ...plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint];
     const coords = fullRoute.map(l => `${l.lng},${l.lat}`).join(';');
     
     try {
@@ -351,7 +503,7 @@ export default function App() {
   const fetchRoute = async () => {
     if (plannedRoute.length < 1) return;
     
-    const fullRoute = [startPoint, ...plannedRoute.filter(l => l.id !== startPoint.id && l.id !== endPoint.id), endPoint];
+    const fullRoute = [startPoint, ...plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint];
     const coords = fullRoute.map(l => `${l.lng},${l.lat}`).join(';');
     
     try {
@@ -386,38 +538,45 @@ export default function App() {
     const [startH, startM] = startTime.split(':').map(Number);
     const [endH, endM] = endTime.split(':').map(Number);
     
-    if (index === 0) return { 
-      time: `${startH % 12 || 12}:${startM.toString().padStart(2, '0')} ${startH >= 12 ? 'PM' : 'AM'}`,
-      isOverdue: false 
-    };
+    const visitDurationSec = visitDuration * 60;
+    const fullRoute = [startPoint, ...plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint].filter(Boolean);
     
     let totalSeconds = 0;
-    const visitDurationSec = visitDuration * 60;
     
-    // Adjust planned route to include start/end if they are not Home
-    const fullRoute = [startPoint, ...plannedRoute.filter(l => l.id !== startPoint.id && l.id !== endPoint.id), endPoint];
-    
+    // Calculate Arrival Time for stop 'index'
     for (let i = 0; i < index; i++) {
-      // Only add visit duration for stops that are not the start/end point if they are Home
-      // Actually, every stop in the middle gets a visit duration.
-      if (i > 0 && i < fullRoute.length - 1) {
+      const currentStop = fullRoute[i];
+      if (!currentStop) continue;
+
+      // If the stop we are leaving (i) is NOT home, we spend time there BEFORE leaving
+      // This applies to the start point (i=0) if it's a store, 
+      // and all subsequent middle stops (i > 0)
+      if (currentStop.id !== 'HOME') {
         totalSeconds += visitDurationSec;
       }
+
+      // Add travel time for the leg leading to stop i+1
       if (routeStats[i]) {
-        totalSeconds += routeStats[i].duration;
+        totalSeconds += (routeStats[i].duration * trafficMultiplier);
       }
     }
     
     const start = new Date();
     start.setHours(startH, startM, 0);
-    const eta = new Date(start.getTime() + totalSeconds * 1000);
+    const arrivalTime = new Date(start.getTime() + totalSeconds * 1000);
+    
+    // Departure time is arrival time + visit duration (if not Home)
+    const departureTime = new Date(arrivalTime.getTime() + (fullRoute[index]?.id !== 'HOME' ? visitDurationSec : 0));
     
     const end = new Date();
     end.setHours(endH, endM, 0);
     
+    const format = (date: Date) => date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    
     return {
-      time: eta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      isOverdue: eta > end
+      arrival: format(arrivalTime),
+      departure: format(departureTime),
+      isOverdue: arrivalTime > end
     };
   };
 
@@ -467,7 +626,7 @@ export default function App() {
   }, [showGasStations]);
 
   const addToRoute = async (location: Location) => {
-    if (!plannedRoute.find(l => l.id === location.id)) {
+    if (!plannedRoute.find(l => l?.id === location.id)) {
       const newRoute = [...plannedRoute, location];
       setPlannedRoute(newRoute);
       if (user) await savePlannedRoute(newRoute, startPoint, endPoint);
@@ -475,12 +634,22 @@ export default function App() {
   };
 
   const removeFromRoute = async (id: string) => {
-    const newRoute = plannedRoute.filter(l => l.id !== id);
+    const newRoute = plannedRoute.filter(l => l?.id !== id);
     setPlannedRoute(newRoute);
     if (user) await savePlannedRoute(newRoute, startPoint, endPoint);
   };
 
-  const isPlanned = (id: string) => plannedRoute.some(l => l.id === id);
+  const isPlanned = (id: string) => plannedRoute.some(l => l?.id === id);
+
+  const moveInRoute = async (index: number, direction: 'up' | 'down') => {
+    const newRoute = [...plannedRoute];
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= newRoute.length) return;
+    
+    [newRoute[index], newRoute[targetIndex]] = [newRoute[targetIndex], newRoute[index]];
+    setPlannedRoute(newRoute);
+    if (user) await savePlannedRoute(newRoute, startPoint, endPoint);
+  };
 
   const routePositions = useMemo(() => 
     plannedRoute.map(loc => [loc.lat, loc.lng] as [number, number]),
@@ -489,8 +658,13 @@ export default function App() {
   const centerPosition: [number, number] = useMemo(() => {
     if (selectedLocation) return [selectedLocation.lat, selectedLocation.lng];
     if (plannedRoute.length > 0) return [plannedRoute[0].lat, plannedRoute[0].lng];
-    return [38.8951, -77.0364]; // DC Center
+    return [38.8654, -76.9448]; // Home
   }, [selectedLocation, plannedRoute]);
+
+  const mapZoom = useMemo(() => {
+    if (selectedLocation) return 15;
+    return 12;
+  }, [selectedLocation]);
 
   const exportToCSV = () => {
     const headers = ["Date", "Stops", "Total Miles", "Total Duration (min)"];
@@ -553,8 +727,8 @@ export default function App() {
   return (
     <div className="flex h-screen bg-neutral-50 font-sans text-neutral-900 overflow-hidden">
       {/* Sidebar */}
-      <div className="w-96 flex flex-col border-r border-neutral-200 bg-white z-10 shadow-xl overflow-y-auto custom-scrollbar">
-        <div className="p-6 border-bottom border-neutral-100">
+      <div className="w-96 flex flex-col border-r border-neutral-200 bg-white z-10 shadow-xl overflow-hidden">
+        <div className="p-6 border-bottom border-neutral-100 shrink-0">
           <div className="flex items-center justify-between mb-6">
             <div className="flex items-center gap-2">
               <div className="p-2 bg-blue-600 rounded-lg">
@@ -579,12 +753,21 @@ export default function App() {
                 <button 
                   onClick={() => setActiveTab('PLANNER')}
                   className={cn("p-2 rounded-lg transition-all", activeTab === 'PLANNER' ? "bg-white shadow-sm text-blue-600" : "text-neutral-400")}
+                  title="Planner"
                 >
                   <MapIcon className="w-4 h-4" />
                 </button>
                 <button 
+                  onClick={() => setActiveTab('VISITED')}
+                  className={cn("p-2 rounded-lg transition-all", activeTab === 'VISITED' ? "bg-white shadow-sm text-green-600" : "text-neutral-400")}
+                  title="Visited Stores"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                </button>
+                <button 
                   onClick={() => setActiveTab('HISTORY')}
                   className={cn("p-2 rounded-lg transition-all", activeTab === 'HISTORY' ? "bg-white shadow-sm text-blue-600" : "text-neutral-400")}
+                  title="Route History"
                 >
                   <Clock className="w-4 h-4" />
                 </button>
@@ -597,7 +780,9 @@ export default function App() {
               </div>
             </div>
           </div>
+        </div>
 
+        <div className="flex-1 overflow-y-auto custom-scrollbar p-6">
           {activeTab === 'PLANNER' && (
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-2">
@@ -732,9 +917,31 @@ export default function App() {
                       />
                       <span className="text-[10px] text-neutral-600 group-hover:text-neutral-900 transition-colors">Show Gas</span>
                     </label>
+                    <label className="flex items-center gap-2 cursor-pointer group">
+                      <input 
+                        type="checkbox" 
+                        className="w-3 h-3 rounded border-neutral-300 text-blue-600 focus:ring-blue-500"
+                        checked={showTrafficLayer}
+                        onChange={(e) => setShowTrafficLayer(e.target.checked)}
+                      />
+                      <span className="text-[10px] text-neutral-600 group-hover:text-neutral-900 transition-colors">Traffic Alerts</span>
+                    </label>
                   </div>
-                  {(avoidTolls || avoidTraffic) && (
-                    <p className="text-[9px] text-blue-500 font-medium italic">* Routing engine will prioritize these preferences where data is available.</p>
+                  {(avoidTolls || avoidTraffic || showTrafficLayer) && (
+                    <div className="space-y-1">
+                      <p className="text-[9px] text-blue-500 font-medium italic">* Routing engine will prioritize these preferences where data is available.</p>
+                      {showTrafficLayer && trafficAlerts.length > 0 && (
+                        <div className="bg-blue-50 p-2 rounded-lg border border-blue-100">
+                          <p className="text-[9px] font-bold text-blue-700 uppercase mb-1 flex items-center gap-1">
+                            <Sparkles className="w-2 h-2" />
+                            Live Traffic Insights
+                          </p>
+                          {trafficAlerts.map((alert, i) => (
+                            <p key={i} className="text-[9px] text-blue-600 leading-tight">• {alert}</p>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   )}
                 </div>
               </div>
@@ -775,7 +982,17 @@ export default function App() {
 
               <div className="flex items-center justify-between px-2 mb-2">
                 <span className="text-xs font-bold uppercase tracking-widest text-neutral-400">Available Stores</span>
-                <span className="text-xs font-medium text-neutral-500">{filteredLocations.length} found</span>
+                <div className="flex items-center gap-2">
+                  {selectedIds.size > 0 && (
+                    <button 
+                      onClick={addSelectedToRoute}
+                      className="text-[10px] font-bold text-blue-600 bg-blue-50 px-2 py-1 rounded-lg hover:bg-blue-100 transition-all"
+                    >
+                      Add {selectedIds.size} Selected
+                    </button>
+                  )}
+                  <span className="text-xs font-medium text-neutral-500">{filteredLocations.length} found</span>
+                </div>
               </div>
               
               {filteredLocations.map((loc) => (
@@ -792,16 +1009,27 @@ export default function App() {
                   )}
                 >
                   <div className="flex justify-between items-start mb-1">
-                    <div className="flex flex-col gap-1">
-                      <span className={cn(
-                        "text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider w-fit",
-                        loc.carrier === 'T-MOBILE' ? "bg-pink-100 text-pink-700" : "bg-purple-100 text-purple-700"
-                      )}>
-                        {loc.carrier}
-                      </span>
-                      <span className="text-[9px] font-bold text-neutral-400 uppercase tracking-tighter">
-                        Area: {loc.city}
-                      </span>
+                    <div className="flex items-center gap-3">
+                      {!isPlanned(loc.id) && (
+                        <input 
+                          type="checkbox"
+                          className="w-4 h-4 rounded border-neutral-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                          checked={selectedIds.has(loc.id)}
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={() => toggleSelection(loc.id)}
+                        />
+                      )}
+                      <div className="flex flex-col gap-1">
+                        <span className={cn(
+                          "text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider w-fit",
+                          loc.carrier === 'T-MOBILE' ? "bg-pink-100 text-pink-700" : "bg-purple-100 text-purple-700"
+                        )}>
+                          {loc.carrier}
+                        </span>
+                        <span className="text-[9px] font-bold text-neutral-400 uppercase tracking-tighter">
+                          Area: {loc.city}
+                        </span>
+                      </div>
                     </div>
                     {isPlanned(loc.id) ? (
                       <CheckCircle2 className="w-5 h-5 text-blue-500" />
@@ -825,6 +1053,47 @@ export default function App() {
                 </motion.div>
               ))}
             </>
+          )}
+
+          {activeTab === 'VISITED' && (
+            <div className="p-6 space-y-6">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-bold uppercase tracking-widest text-neutral-400">Visited Stores</h3>
+                <span className="text-xs font-bold bg-green-50 text-green-600 px-2 py-1 rounded-lg">
+                  {visitedLocations.length} Completed
+                </span>
+              </div>
+              
+              <div className="space-y-3">
+                {visitedLocations.map((loc) => (
+                  <div 
+                    key={loc.id}
+                    className="p-4 bg-neutral-50 border border-neutral-100 rounded-2xl flex items-center gap-4"
+                  >
+                    <div className="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center shrink-0">
+                      <CheckCircle2 className="w-5 h-5 text-green-600" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-bold text-neutral-800 truncate">{loc.name}</p>
+                      <p className="text-xs text-neutral-500 truncate">{loc.address}</p>
+                      <div className="mt-1 flex items-center gap-2">
+                        <span className="text-[10px] font-bold text-neutral-400 uppercase">{loc.carrier}</span>
+                        <div className="w-1 h-1 rounded-full bg-neutral-300" />
+                        <span className="text-[10px] font-bold text-green-600 uppercase">Checked Off</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                {visitedLocations.length === 0 && (
+                  <div className="text-center py-20">
+                    <div className="w-16 h-16 bg-neutral-50 rounded-full flex items-center justify-center mx-auto mb-4">
+                      <CheckCircle2 className="w-8 h-8 text-neutral-200" />
+                    </div>
+                    <p className="text-neutral-400 text-sm italic">No stores visited yet.</p>
+                  </div>
+                )}
+              </div>
+            </div>
           )}
 
           {activeTab === 'HISTORY' && (
@@ -906,16 +1175,54 @@ export default function App() {
                 <h4 className="text-xs font-bold text-neutral-500 uppercase px-2">Store Clusters</h4>
                 <div className="grid grid-cols-1 gap-2 px-2">
                   {(Object.entries(clusters) as [string, Location[]][]).sort((a, b) => b[1].length - a[1].length).slice(0, 8).map(([area, stores]) => (
-                    <div key={area} className="flex items-center justify-between p-3 bg-neutral-50 rounded-xl">
-                      <div>
-                        <p className="text-xs font-bold text-neutral-700">{area}</p>
-                        <p className="text-[10px] text-neutral-400">{stores.length} locations in this cluster</p>
+                    <div key={area} className="space-y-2">
+                      <div 
+                        onClick={() => setExpandedCluster(expandedCluster === area ? null : area)}
+                        className={cn(
+                          "flex items-center justify-between p-3 rounded-xl transition-all cursor-pointer",
+                          expandedCluster === area ? "bg-blue-50 border border-blue-200 shadow-sm" : "bg-neutral-50 border border-transparent hover:bg-neutral-100"
+                        )}
+                      >
+                        <div>
+                          <p className="text-xs font-bold text-neutral-700">{area}</p>
+                          <p className="text-[10px] text-neutral-400">{stores.length} locations in this cluster</p>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <span className="text-[10px] font-bold bg-white px-2 py-1 rounded-lg border border-neutral-200">
+                            {Math.round((stores.length / locations.length) * 100)}%
+                          </span>
+                          <ChevronRight className={cn("w-4 h-4 text-neutral-400 transition-transform", expandedCluster === area && "rotate-90")} />
+                        </div>
                       </div>
-                      <div className="text-right">
-                        <span className="text-[10px] font-bold bg-white px-2 py-1 rounded-lg border border-neutral-200">
-                          {Math.round((stores.length / locations.length) * 100)}%
-                        </span>
-                      </div>
+                      
+                      <AnimatePresence>
+                        {expandedCluster === area && (
+                          <motion.div 
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            className="overflow-hidden"
+                          >
+                            <div className="bg-white border border-neutral-100 rounded-xl p-2 space-y-1 ml-2">
+                              {stores.map(store => (
+                                <div 
+                                  key={store.id}
+                                  onClick={() => {
+                                    setActiveTab('PLANNER');
+                                  }}
+                                  className="p-2 hover:bg-neutral-50 rounded-lg transition-colors cursor-pointer flex items-center justify-between group"
+                                >
+                                  <div className="min-w-0">
+                                    <p className="text-[11px] font-semibold text-neutral-800 truncate">{store.address}</p>
+                                    <p className="text-[9px] text-neutral-400 uppercase font-bold">{store.carrier}</p>
+                                  </div>
+                                  <MapPin className="w-3 h-3 text-neutral-300 group-hover:text-blue-500 transition-colors" />
+                                </div>
+                              ))}
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </div>
                   ))}
                 </div>
@@ -925,13 +1232,32 @@ export default function App() {
         </div>
 
         {/* Planned Route Summary */}
-        <div className="p-6 bg-neutral-900 text-white">
+        <div className="p-6 bg-neutral-900 text-white shrink-0">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
               <Calendar className="w-5 h-5 text-blue-400" />
               <h2 className="font-bold">Today's Route</h2>
+              {isRouteConfirmed && (
+                <span className="ml-2 px-2 py-0.5 bg-green-500/20 text-green-400 text-[10px] font-bold rounded uppercase tracking-wider flex items-center gap-1">
+                  <CheckCircle2 className="w-3 h-3" />
+                  Confirmed
+                </span>
+              )}
             </div>
             <div className="flex gap-2">
+              {plannedRoute.length > 0 && (
+                <button 
+                  onClick={async () => {
+                    await fetchRoute();
+                    setAssignDate(selectedDate);
+                    setShowReviewModal(true);
+                  }}
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg transition-all text-xs font-bold flex items-center gap-1"
+                >
+                  <CheckCircle2 className="w-3 h-3" />
+                  Review & Confirm
+                </button>
+              )}
               {plannedRoute.length > 2 && (
                 <button 
                   onClick={optimizeRoute}
@@ -942,6 +1268,29 @@ export default function App() {
                   <Filter className={cn("w-4 h-4", isOptimizing && "animate-spin")} />
                 </button>
               )}
+              <button 
+                onClick={async () => {
+                  if (confirm("Are you sure you want to clear the entire route for today?")) {
+                    setPlannedRoute([]);
+                    setStartPoint(HOME_LOCATION as Location);
+                    setEndPoint(HOME_LOCATION as Location);
+                    if (user) {
+                      const q = query(
+                        collection(db, `users/${user.uid}/plannedRoutes`),
+                        where('date', '==', selectedDate)
+                      );
+                      const snapshot = await getDocs(q);
+                      if (!snapshot.empty) {
+                        await deleteDoc(doc(db, `users/${user.uid}/plannedRoutes`, snapshot.docs[0].id));
+                      }
+                    }
+                  }
+                }}
+                className="p-1.5 bg-neutral-800 hover:bg-red-900/40 rounded-lg transition-all text-red-400"
+                title="Clear Route"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
               <span className="bg-blue-600 px-2 py-0.5 rounded text-xs font-bold">
                 {plannedRoute.length} STOPS
               </span>
@@ -951,21 +1300,25 @@ export default function App() {
           <div className="space-y-3 max-h-96 overflow-y-auto pr-2 custom-scrollbar">
             <AnimatePresence mode="popLayout">
               {/* Start Point */}
-              <div className="flex items-center gap-3 mb-2 p-2 bg-neutral-50 rounded-xl border border-neutral-100">
+              <motion.div 
+                key="start-point"
+                layout
+                className="flex items-center gap-3 mb-2 p-2 bg-neutral-50 rounded-xl border border-neutral-100"
+              >
                 <div className="w-6 h-6 rounded-full bg-neutral-900 border border-neutral-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
-                  S
+                  1
                 </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-xs font-bold truncate">{startPoint.address}</p>
-                  <p className="text-[10px] text-neutral-500">{calculateETA(0).time} Departure</p>
+                  <p className="text-xs font-bold truncate">{startPoint?.address || 'Home'}</p>
+                  <p className="text-[10px] text-neutral-500">{calculateETA(0).departure} Departure</p>
                 </div>
-                {startPoint.id !== 'HOME' && (
+                {startPoint?.id !== 'HOME' && (
                   <button onClick={() => setStartPoint(HOME_LOCATION as Location)} className="text-[10px] text-blue-600 font-bold hover:underline">Reset</button>
                 )}
-              </div>
+              </motion.div>
 
-              {plannedRoute.filter(l => l.id !== startPoint.id && l.id !== endPoint.id).map((loc, index) => (
-                <React.Fragment key={loc.id}>
+              {plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, index) => (
+                <motion.div key={loc.id} layout>
                   {routeStats[index] && (
                     <div className="flex items-center gap-2 ml-3 py-1 border-l border-dashed border-neutral-700 pl-4">
                       <div className="flex flex-col text-[9px] text-neutral-500 font-bold uppercase tracking-tighter">
@@ -981,19 +1334,39 @@ export default function App() {
                     className="flex items-center gap-3 group p-2 hover:bg-neutral-50 rounded-xl transition-all"
                   >
                     <div className="w-6 h-6 rounded-full bg-blue-500/20 border border-blue-500/50 flex items-center justify-center text-[10px] font-bold text-blue-400 shrink-0">
-                      {index + 1}
+                      {index + 2}
                     </div>
                     <div className="flex-1 min-w-0">
                       <p className="text-xs font-medium truncate">{loc.address}</p>
                       <div className={cn(
-                        "flex items-center gap-1 text-[10px]",
+                        "flex items-center gap-2 text-[10px]",
                         calculateETA(index + 1).isOverdue ? "text-red-400 font-bold" : "text-neutral-500"
                       )}>
-                        <Clock className="w-3 h-3" />
-                        <span>ETA: {calculateETA(index + 1).time}</span>
+                        <div className="flex items-center gap-1">
+                          <Clock className="w-3 h-3" />
+                          <span>Arr: {calculateETA(index + 1).arrival}</span>
+                        </div>
+                        <div className="w-1 h-1 rounded-full bg-neutral-300" />
+                        <div className="flex items-center gap-1">
+                          <span>Dep: {calculateETA(index + 1).departure}</span>
+                        </div>
                       </div>
                     </div>
                     <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
+                      <button 
+                        onClick={() => moveInRoute(index, 'up')}
+                        disabled={index === 0}
+                        className="p-1 text-neutral-400 hover:text-blue-500 disabled:opacity-30"
+                      >
+                        <ChevronUp className="w-3 h-3" />
+                      </button>
+                      <button 
+                        onClick={() => moveInRoute(index, 'down')}
+                        disabled={index === plannedRoute.length - 1}
+                        className="p-1 text-neutral-400 hover:text-blue-500 disabled:opacity-30"
+                      >
+                        <ChevronDown className="w-3 h-3" />
+                      </button>
                       <button 
                         onClick={() => setStartPoint(loc)}
                         className="p-1 text-neutral-400 hover:text-green-500"
@@ -1016,12 +1389,12 @@ export default function App() {
                       </button>
                     </div>
                   </motion.div>
-                </React.Fragment>
+                </motion.div>
               ))}
 
               {/* End Point */}
               {plannedRoute.length > 0 && (
-                <>
+                <motion.div key="end-point" layout>
                   {routeStats[plannedRoute.length] && (
                     <div className="flex items-center gap-2 ml-3 py-1 border-l border-dashed border-neutral-700 pl-4">
                       <div className="flex flex-col text-[9px] text-neutral-500 font-bold uppercase tracking-tighter">
@@ -1032,22 +1405,22 @@ export default function App() {
                   )}
                   <div className="flex items-center gap-3 mt-2 p-2 bg-neutral-50 rounded-xl border border-neutral-100">
                     <div className="w-6 h-6 rounded-full bg-neutral-900 border border-neutral-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
-                      E
+                      {plannedRoute.length + 2}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs font-bold truncate">{endPoint.address}</p>
+                      <p className="text-xs font-bold truncate">{endPoint?.address}</p>
                       <p className={cn(
                         "text-[10px]",
                         calculateETA(plannedRoute.length + 1).isOverdue ? "text-red-400 font-bold" : "text-neutral-500"
                       )}>
-                        ETA: {calculateETA(plannedRoute.length + 1).time}
+                        Arrival: {calculateETA(plannedRoute.length + 1).arrival}
                       </p>
                     </div>
-                    {endPoint.id !== 'HOME' && (
+                    {endPoint?.id !== 'HOME' && (
                       <button onClick={() => setEndPoint(HOME_LOCATION as Location)} className="text-[10px] text-blue-600 font-bold hover:underline">Reset</button>
                     )}
                   </div>
-                </>
+                </motion.div>
               )}
             </AnimatePresence>
             {plannedRoute.length === 0 && (
@@ -1083,6 +1456,7 @@ export default function App() {
       <AnimatePresence>
         {isNavigating && (
           <motion.div 
+            key="nav-instructions"
             initial={{ x: -400 }}
             animate={{ x: 0 }}
             exit={{ x: -400 }}
@@ -1134,16 +1508,9 @@ export default function App() {
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
           
-          <MapUpdater center={centerPosition} />
+          <MapUpdater center={centerPosition} zoom={mapZoom} />
 
-          <Marker position={[HOME_LOCATION.lat, HOME_LOCATION.lng]} icon={homeIcon}>
-            <Popup>
-              <div className="p-1">
-                <h4 className="font-bold text-sm">Home Base</h4>
-                <p className="text-xs text-neutral-600">{HOME_LOCATION.address}</p>
-              </div>
-            </Popup>
-          </Marker>
+          <Marker position={[HOME_LOCATION.lat, HOME_LOCATION.lng]} icon={homeIcon} />
 
           {showGasStations && gasStations.map((station) => (
             <Marker 
@@ -1157,56 +1524,46 @@ export default function App() {
                 iconSize: [32, 32],
                 iconAnchor: [16, 32],
               })}
-            >
-              <Popup>
-                <div className="p-2 min-w-[150px]">
-                  <div className="flex items-center gap-2 mb-1">
-                    <div className="p-1 bg-green-100 rounded text-green-600">
-                      <Fuel className="w-3 h-3" />
-                    </div>
-                    <h4 className="font-bold text-sm">{station.name}</h4>
-                  </div>
-                  <p className="text-[10px] text-neutral-500 mb-2">{station.brand}</p>
-                  <div className="flex items-center justify-between bg-neutral-50 p-2 rounded-lg">
-                    <span className="text-[10px] font-bold text-neutral-400 uppercase">Regular</span>
-                    <span className="text-sm font-bold text-green-600">${station.price}</span>
-                  </div>
-                </div>
-              </Popup>
-            </Marker>
+            />
           ))}
 
-          {filteredLocations.map((loc) => (
-            <Marker 
-              key={loc.id} 
-              position={[loc.lat, loc.lng]}
-              icon={isPlanned(loc.id) ? plannedIcon : (selectedLocation?.id === loc.id ? activeIcon : defaultIcon)}
-              eventHandlers={{
-                click: () => setSelectedLocation(loc)
-              }}
-            >
-              <Popup>
-                <div className="p-1">
-                  <p className="text-[10px] font-bold text-neutral-400 uppercase mb-1">{loc.carrier}</p>
-                  <h4 className="font-bold text-sm mb-1">{loc.address}</h4>
-                  <p className="text-xs text-neutral-600 mb-3">{loc.city}, {loc.state}</p>
-                  {!isPlanned(loc.id) ? (
-                    <button 
-                      onClick={() => addToRoute(loc)}
-                      className="w-full py-1.5 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 transition-all"
-                    >
-                      Add to Route
-                    </button>
-                  ) : (
-                    <div className="flex items-center gap-2 text-blue-600 font-bold text-xs">
-                      <CheckCircle2 className="w-4 h-4" />
-                      Planned Stop
-                    </div>
+          {/* Render markers for both available stores and the current planned route */}
+          {Array.from(new Set([
+            ...filteredLocations.filter(l => !!l).map(l => l.id), 
+            ...plannedRoute.filter(l => !!l).map(l => l.id)
+          ]))
+            .map(id => locations.find(l => l.id === id))
+            .filter((loc): loc is Location => !!loc)
+            .map((loc) => {
+              const fullRoute = [startPoint, ...plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint].filter(Boolean);
+              const routeIndex = fullRoute.findIndex(p => p?.id === loc.id);
+              const isInRoute = routeIndex !== -1;
+              const isSelected = selectedLocation?.id === loc.id;
+              const isVisited = visitedStoreIds.has(loc.id);
+              
+              let color = '#ef4444'; // Default red
+              if (isVisited) color = '#10b981'; // Visited green (checked off)
+              if (isInRoute) color = '#3b82f6'; // Planned blue
+              if (isSelected) color = '#10b981'; // Selected green
+              
+              return (
+                <Marker 
+                  key={loc.id} 
+                  position={[loc.lat, loc.lng]}
+                  icon={createMarkerIcon(
+                    color, 
+                    isInRoute, 
+                    isInRoute ? routeIndex + 1 : undefined,
+                    isSelected
                   )}
-                </div>
-              </Popup>
-            </Marker>
-          ))}
+                  eventHandlers={{
+                    click: () => {
+                      addToRoute(loc);
+                    }
+                  }}
+                />
+              );
+            })}
 
           {isNavigating && routeGeometry.length > 0 ? (
             <Polyline 
@@ -1250,73 +1607,99 @@ export default function App() {
           </button>
         </div>
 
-        {/* Selected Location Card (Floating) */}
+        {/* Review Modal */}
         <AnimatePresence>
-          {selectedLocation && (
-            <motion.div
-              initial={{ opacity: 0, y: 100 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 100 }}
-              className="absolute bottom-8 left-1/2 -translate-x-1/2 w-full max-w-md px-4 z-[1000]"
+          {showReviewModal && (
+            <motion.div 
+              key="review-modal-overlay"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-[2000] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
             >
-              <div className="bg-white rounded-3xl shadow-2xl border border-neutral-200 p-6">
-                <div className="flex justify-between items-start mb-4">
-                  <div>
-                    <span className={cn(
-                      "text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider mb-2 inline-block",
-                      selectedLocation.carrier === 'T-MOBILE' ? "bg-pink-100 text-pink-700" : "bg-purple-100 text-purple-700"
-                    )}>
-                      {selectedLocation.carrier}
-                    </span>
-                    <h2 className="text-xl font-bold">{selectedLocation.address}</h2>
-                    <p className="text-neutral-500 text-sm">{selectedLocation.city}, {selectedLocation.state}</p>
-                  </div>
-                  <button 
-                    onClick={() => setSelectedLocation(null)}
-                    className="p-2 hover:bg-neutral-100 rounded-full text-neutral-400"
-                  >
+              <motion.div 
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95 }}
+                className="bg-white rounded-3xl w-full max-w-md overflow-hidden shadow-2xl"
+              >
+                <div className="p-6 border-b border-neutral-100 flex justify-between items-center">
+                  <h3 className="text-xl font-bold text-neutral-900">Review Route</h3>
+                  <button onClick={() => setShowReviewModal(false)} className="p-2 hover:bg-neutral-100 rounded-full text-neutral-400">
                     <X className="w-5 h-5" />
                   </button>
                 </div>
                 
-                <div className="grid grid-cols-2 gap-4 mb-6">
-                  <div className="p-3 bg-neutral-50 rounded-2xl">
-                    <div className="flex items-center gap-2 text-neutral-400 mb-1">
-                      <Clock className="w-3 h-3" />
-                      <span className="text-[10px] font-bold uppercase tracking-wider">Est. Visit</span>
+                <div className="p-6 space-y-6">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="p-4 bg-neutral-50 rounded-2xl">
+                      <p className="text-[10px] font-bold text-neutral-400 uppercase mb-1">Total Stops</p>
+                      <p className="text-xl font-bold text-neutral-900">{plannedRoute.length + 2}</p>
                     </div>
-                    <p className="text-sm font-semibold">45 mins</p>
+                    <div className="p-4 bg-neutral-50 rounded-2xl">
+                      <p className="text-[10px] font-bold text-neutral-400 uppercase mb-1">Est. Distance</p>
+                      <p className="text-xl font-bold text-neutral-900">
+                        {(routeStats.reduce((acc, curr) => acc + curr.distance, 0) * 0.000621371).toFixed(1)} mi
+                      </p>
+                    </div>
                   </div>
-                  <div className="p-3 bg-neutral-50 rounded-2xl">
-                    <div className="flex items-center gap-2 text-neutral-400 mb-1">
-                      <MapIcon className="w-3 h-3" />
-                      <span className="text-[10px] font-bold uppercase tracking-wider">Distance</span>
+
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-neutral-400 uppercase px-1">Assign to Date</label>
+                    <input 
+                      type="date" 
+                      value={assignDate}
+                      onChange={(e) => setAssignDate(e.target.value)}
+                      min="2026-04-11"
+                      max="2026-05-29"
+                      className="w-full p-4 bg-neutral-50 rounded-2xl border-none focus:ring-2 focus:ring-blue-500 font-bold text-neutral-700"
+                    />
+                  </div>
+
+                  <div className="max-h-48 overflow-y-auto space-y-2 pr-2 custom-scrollbar">
+                    <div className="flex items-center gap-3 p-2 bg-blue-50 rounded-xl">
+                      <div className="w-5 h-5 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white">1</div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-medium truncate">{startPoint?.address || 'Home'}</p>
+                        <p className="text-[9px] text-blue-600 font-bold">Dep: {calculateETA(0).departure}</p>
+                      </div>
                     </div>
-                    <p className="text-sm font-semibold">2.4 miles</p>
+                    {plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, i) => (
+                      <div key={loc.id} className="flex items-center gap-3 p-2 bg-neutral-50 rounded-xl">
+                        <div className="w-5 h-5 rounded-full bg-neutral-200 flex items-center justify-center text-[10px] font-bold text-neutral-600">{i + 2}</div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-medium truncate">{loc.address}</p>
+                          <p className="text-[9px] text-neutral-500">
+                            Arr: {calculateETA(i + 1).arrival} • Dep: {calculateETA(i + 1).departure}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                    <div className="flex items-center gap-3 p-2 bg-blue-50 rounded-xl">
+                      <div className="w-5 h-5 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white">{plannedRoute.length + 2}</div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-medium truncate">{endPoint.address}</p>
+                        <p className="text-[9px] text-blue-600 font-bold">Arr: {calculateETA(plannedRoute.length + 1).arrival}</p>
+                      </div>
+                    </div>
                   </div>
                 </div>
 
-                <div className="flex gap-3">
-                  {!isPlanned(selectedLocation.id) ? (
-                    <button 
-                      onClick={() => addToRoute(selectedLocation)}
-                      className="flex-1 py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl font-bold transition-all shadow-lg shadow-blue-600/20"
-                    >
-                      Add to Route
-                    </button>
-                  ) : (
-                    <button 
-                      onClick={() => removeFromRoute(selectedLocation.id)}
-                      className="flex-1 py-4 bg-red-50 hover:bg-red-100 text-red-600 rounded-2xl font-bold transition-all"
-                    >
-                      Remove from Route
-                    </button>
-                  )}
-                  <button className="px-6 py-4 bg-neutral-100 hover:bg-neutral-200 rounded-2xl transition-all">
-                    <ChevronRight className="w-6 h-6" />
+                <div className="p-6 bg-neutral-50 flex gap-3">
+                  <button 
+                    onClick={() => setShowReviewModal(false)}
+                    className="flex-1 py-4 bg-white border border-neutral-200 rounded-2xl font-bold text-neutral-600 hover:bg-neutral-100 transition-all"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    onClick={confirmRoute}
+                    className="flex-1 py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl font-bold transition-all shadow-lg shadow-blue-600/20"
+                  >
+                    Confirm & Save
                   </button>
                 </div>
-              </div>
+              </motion.div>
             </motion.div>
           )}
         </AnimatePresence>
@@ -1326,6 +1709,7 @@ export default function App() {
           <AnimatePresence>
             {showChat && (
               <motion.div
+                key="chat-window"
                 initial={{ opacity: 0, scale: 0.9, y: 20 }}
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.9, y: 20 }}

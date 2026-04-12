@@ -7,6 +7,9 @@ export interface Location {
   lat: number;
   lng: number;
   carrier: string;
+  hours?: string;
+  phone?: string;
+  notes?: string;
 }
 
 export const locations: Location[] = [
