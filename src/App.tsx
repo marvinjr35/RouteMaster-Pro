@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap, useMapEvents, Polygon, Circle, Tooltip as LeafletTooltip } from 'react-leaflet';
 import L from 'leaflet';
 import inside from 'point-in-polygon';
-import { motion, AnimatePresence } from 'motion/react';
+import { motion, AnimatePresence, Reorder } from 'motion/react';
 import { 
   BarChart, 
   Bar, 
@@ -33,7 +33,9 @@ import {
   MousePointer2,
   Square as SquareIcon,
   Circle as CircleIcon,
-  Check
+  Check,
+  GripVertical,
+  AlertCircle
 } from 'lucide-react';
 import { locations, Location } from './data';
 import { cn } from './lib/utils';
@@ -1863,7 +1865,21 @@ export default function App() {
                 </div>
                 <div className="flex-1 min-w-0">
                   <p className="text-xs font-bold truncate">{startPoint?.address || 'Home'}</p>
-                  <p className="text-[10px] text-neutral-500">{calculateETA(0).departure} Departure</p>
+                  <div className={cn(
+                    "flex items-center gap-2 text-[10px]",
+                    calculateETA(0).isOverdue ? "text-red-500 font-bold" : "text-neutral-500"
+                  )}>
+                    <div className="flex items-center gap-1">
+                      <Clock className="w-3 h-3 text-blue-500" />
+                      <span>Dep: {calculateETA(0).departure}</span>
+                    </div>
+                    {calculateETA(0).isOverdue && (
+                      <div className="flex items-center gap-1 text-red-500 animate-pulse">
+                        <AlertCircle className="w-3 h-3" />
+                        <span>Overdue</span>
+                      </div>
+                    )}
+                  </div>
                 </div>
                 {startPoint?.id !== 'HOME' && (
                   <div className="flex items-center gap-1 bg-neutral-100 px-2 py-1 rounded-lg">
@@ -1901,19 +1917,25 @@ export default function App() {
                       {index + 2}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs font-medium truncate">{loc.address}</p>
+                      <p className="text-xs font-medium truncate leading-tight">{loc.address}</p>
                       <div className={cn(
-                        "flex items-center gap-2 text-[10px]",
-                        calculateETA(index + 1).isOverdue ? "text-red-400 font-bold" : "text-neutral-500"
+                        "flex items-center gap-2 text-[10px] mt-0.5",
+                        calculateETA(index + 1).isOverdue ? "text-red-500" : "text-neutral-500"
                       )}>
                         <div className="flex items-center gap-1">
                           <Clock className="w-3 h-3" />
-                          <span>Arr: {calculateETA(index + 1).arrival}</span>
+                          <span className="font-bold">Arr: {calculateETA(index + 1).arrival}</span>
                         </div>
-                        <div className="w-1 h-1 rounded-full bg-neutral-300" />
+                        <div className="w-0.5 h-0.5 rounded-full bg-neutral-300" />
                         <div className="flex items-center gap-1">
                           <span>Dep: {calculateETA(index + 1).departure}</span>
                         </div>
+                        {calculateETA(index + 1).isOverdue && (
+                          <div className="flex items-center gap-1 font-bold animate-pulse">
+                            <AlertCircle className="w-3 h-3" />
+                            <span>Overdue</span>
+                          </div>
+                        )}
                       </div>
                     </div>
                     <div className="flex items-center gap-1 bg-neutral-100 px-2 py-1 rounded-lg">
@@ -1981,13 +2003,22 @@ export default function App() {
                       {plannedRoute.length + 2}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs font-bold truncate">{endPoint?.address}</p>
-                      <p className={cn(
-                        "text-[10px]",
-                        calculateETA(plannedRoute.length + 1).isOverdue ? "text-red-400 font-bold" : "text-neutral-500"
+                      <p className="text-xs font-bold truncate">{endPoint?.address || 'End Point'}</p>
+                      <div className={cn(
+                        "flex items-center gap-2 text-[10px] mt-0.5",
+                        calculateETA(plannedRoute.length + 1).isOverdue ? "text-red-500 font-bold" : "text-neutral-500"
                       )}>
-                        Arrival: {calculateETA(plannedRoute.length + 1).arrival}
-                      </p>
+                        <div className="flex items-center gap-1">
+                          <Clock className="w-3 h-3" />
+                          <span>Arr: {calculateETA(plannedRoute.length + 1).arrival}</span>
+                        </div>
+                        {calculateETA(plannedRoute.length + 1).isOverdue && (
+                          <div className="flex items-center gap-1 text-red-500 animate-pulse">
+                            <AlertCircle className="w-3 h-3" />
+                            <span>Overdue</span>
+                          </div>
+                        )}
+                      </div>
                     </div>
                     {endPoint?.id !== 'HOME' && (
                       <div className="flex items-center gap-1 bg-neutral-100 px-2 py-1 rounded-lg">
@@ -2393,62 +2424,108 @@ export default function App() {
                     />
                   </div>
 
-                  <div className="max-h-48 overflow-y-auto space-y-2 pr-2 custom-scrollbar">
-                    <div className="flex items-center gap-3 p-2 bg-blue-50 rounded-xl">
-                      <div className="w-5 h-5 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white">1</div>
+                  <Reorder.Group 
+                    axis="y" 
+                    values={plannedRoute} 
+                    onReorder={setPlannedRoute}
+                    className="max-h-[300px] overflow-y-auto space-y-2 pr-2 custom-scrollbar p-1"
+                  >
+                    <div className="flex items-center gap-3 p-3 bg-blue-50/50 border border-blue-100 rounded-2xl mb-2">
+                      <div className="w-6 h-6 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white shrink-0 shadow-lg shadow-blue-600/20">1</div>
                       <div className="flex-1 min-w-0">
-                        <p className="text-xs font-medium truncate">{startPoint?.address || 'Home'}</p>
-                        <p className="text-[9px] text-blue-600 font-bold">Dep: {calculateETA(0).departure}</p>
+                        <p className="text-sm font-semibold truncate text-neutral-800">{startPoint?.address || 'Start Point'}</p>
+                        <p className="text-[10px] text-blue-600 font-bold uppercase tracking-wider">Dep: {calculateETA(0).departure}</p>
                       </div>
                     </div>
-                    {plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, i) => {
-                      const originalIndex = plannedRoute.findIndex(l => l && l.id === loc.id);
-                      return (
-                        <div key={loc.id} className="flex items-center gap-3 p-2 bg-neutral-50 rounded-xl group">
-                          <div className="w-5 h-5 rounded-full bg-neutral-200 flex items-center justify-center text-[10px] font-bold text-neutral-600">{i + 2}</div>
-                          <div className="flex-1 min-w-0">
-                            <p className="text-xs font-medium truncate">{loc.address}</p>
-                            <p className="text-[9px] text-neutral-500">
-                              Arr: {calculateETA(i + 1).arrival} • Dep: {calculateETA(i + 1).departure}
-                            </p>
+
+                    {plannedRoute.map((loc, i) => (
+                      <Reorder.Item 
+                        key={loc.id} 
+                        value={loc}
+                        onDragEnd={async () => {
+                          if (user) await savePlannedRoute(plannedRoute, startPoint, endPoint);
+                          await fetchRoute(true);
+                        }}
+                      >
+                        <div className="flex items-center gap-3 p-3 bg-white border border-neutral-100 rounded-2xl group hover:border-blue-300 hover:shadow-md transition-all">
+                          <div className="cursor-grab active:cursor-grabbing text-neutral-300 hover:text-neutral-500 transition-colors">
+                            <GripVertical className="w-5 h-5" />
                           </div>
-                          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
+                          <div className="w-6 h-6 rounded-full bg-neutral-100 flex items-center justify-center text-[10px] font-bold text-neutral-600 shrink-0 border border-neutral-200">
+                            {i + 2}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-semibold text-neutral-800 truncate">{loc.address}</p>
+                            <div className={cn(
+                              "flex items-center gap-2 text-[10px] mt-0.5",
+                              calculateETA(i + 1).isOverdue ? "text-red-500" : "text-neutral-500"
+                            )}>
+                              <div className="flex items-center gap-1">
+                                <Clock className="w-3 h-3" />
+                                <span className="font-bold">Arr: {calculateETA(i + 1).arrival}</span>
+                              </div>
+                              <div className="w-1 h-1 rounded-full bg-neutral-300" />
+                              <div className="flex items-center gap-1">
+                                <span>Dep: {calculateETA(i + 1).departure}</span>
+                              </div>
+                              {calculateETA(i + 1).isOverdue && (
+                                <div className="flex items-center gap-1 font-bold animate-pulse">
+                                  <AlertCircle className="w-3 h-3" />
+                                  <span>Overdue</span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                             <button 
                               onClick={async () => {
-                                await moveInRoute(originalIndex, 'up');
+                                await moveInRoute(i, 'up');
                                 await fetchRoute(true);
                               }}
                               disabled={i === 0}
-                              className="p-1 text-neutral-400 hover:text-blue-500 disabled:opacity-30"
+                              className="p-1.5 text-neutral-400 hover:text-blue-500 disabled:opacity-30 transition-colors"
                             >
-                              <ChevronUp className="w-3 h-3" />
+                              <ChevronUp className="w-4 h-4" />
                             </button>
                             <button 
                               onClick={async () => {
-                                await moveInRoute(originalIndex, 'down');
+                                await moveInRoute(i, 'down');
                                 await fetchRoute(true);
                               }}
-                              disabled={i === plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).length - 1}
-                              className="p-1 text-neutral-400 hover:text-blue-500 disabled:opacity-30"
+                              disabled={i === plannedRoute.length - 1}
+                              className="p-1.5 text-neutral-400 hover:text-blue-500 disabled:opacity-30 transition-colors"
                             >
-                              <ChevronDown className="w-3 h-3" />
+                              <ChevronDown className="w-4 h-4" />
                             </button>
                           </div>
                         </div>
-                      );
-                    })}
-                    <div className="flex items-center gap-3 p-2 bg-blue-50 rounded-xl">
-                      <div className="w-5 h-5 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white">
-                        {plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).length + 2}
+                      </Reorder.Item>
+                    ))}
+
+                    <div className="flex items-center gap-3 p-3 bg-blue-50/50 border border-blue-100 rounded-2xl mt-2">
+                      <div className="w-6 h-6 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white shrink-0 shadow-lg shadow-blue-600/20">
+                        {plannedRoute.length + 2}
                       </div>
                       <div className="flex-1 min-w-0">
-                        <p className="text-xs font-medium truncate">{endPoint?.address || 'Home'}</p>
-                        <p className="text-[9px] text-blue-600 font-bold">
-                          Arr: {calculateETA(plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).length + 1).arrival}
-                        </p>
+                        <p className="text-sm font-semibold truncate text-neutral-800">{endPoint?.address || 'End Point'}</p>
+                        <div className={cn(
+                          "flex items-center gap-2 text-[10px] mt-0.5",
+                          calculateETA(plannedRoute.length + 1).isOverdue ? "text-red-500" : "text-blue-600"
+                        )}>
+                          <div className="flex items-center gap-1">
+                            <Clock className="w-3 h-3" />
+                            <span className="font-bold uppercase tracking-wider">Arrival: {calculateETA(plannedRoute.length + 1).arrival}</span>
+                          </div>
+                          {calculateETA(plannedRoute.length + 1).isOverdue && (
+                            <div className="flex items-center gap-1 font-bold animate-pulse">
+                              <AlertCircle className="w-3 h-3" />
+                              <span>Overdue</span>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     </div>
-                  </div>
+                  </Reorder.Group>
                 </div>
 
                 <div className="p-6 bg-neutral-50 flex gap-3">
