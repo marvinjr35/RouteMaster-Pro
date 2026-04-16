@@ -5,3 +5,16 @@
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
+
+.leaflet-tooltip {
+  background: white !important;
+  border: 1px solid #e5e7eb !important;
+  border-radius: 1rem !important;
+  padding: 0 !important;
+  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1) !important;
+  overflow: hidden;
+}
+
+.leaflet-tooltip-top:before {
+  border-top-color: white !important;
+}

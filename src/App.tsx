@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap, useMapEvents, Polygon, Circle, Tooltip as LeafletTooltip } from 'react-leaflet';
 import L from 'leaflet';
+import inside from 'point-in-polygon';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   BarChart, 
@@ -16,7 +17,6 @@ import {
   Calendar, 
   Map as MapIcon, 
   CheckCircle2, 
-  Circle, 
   Navigation, 
   Plus, 
   Trash2, 
@@ -27,7 +27,13 @@ import {
   Filter,
   Clock,
   MapPin,
-  Fuel
+  Fuel,
+  ArrowRightLeft,
+  Layers,
+  MousePointer2,
+  Square as SquareIcon,
+  Circle as CircleIcon,
+  Check
 } from 'lucide-react';
 import { locations, Location } from './data';
 import { cn } from './lib/utils';
@@ -95,6 +101,55 @@ function MapUpdater({ center, zoom }: { center: [number, number], zoom?: number 
     map.setView(center, zoom || 12, { animate: true });
   }, [center, zoom, map]);
   return null;
+}
+
+function DrawingLayer({ 
+  mode, 
+  points, 
+  setPoints, 
+  circle, 
+  setCircle 
+}: { 
+  mode: 'polygon' | 'circle' | null, 
+  points: [number, number][], 
+  setPoints: (p: [number, number][]) => void,
+  circle: { center: [number, number], radius: number } | null,
+  setCircle: (c: { center: [number, number], radius: number } | null) => void
+}) {
+  useMapEvents({
+    click(e) {
+      if (mode === 'polygon') {
+        setPoints([...points, [e.latlng.lat, e.latlng.lng]]);
+      } else if (mode === 'circle') {
+        if (!circle || circle.radius > 0) {
+          setCircle({ center: [e.latlng.lat, e.latlng.lng], radius: 0 });
+        } else {
+          // Second click sets radius
+          const dist = L.latLng(circle.center).distanceTo(e.latlng);
+          setCircle({ ...circle, radius: dist });
+        }
+      }
+    }
+  });
+
+  return (
+    <>
+      {mode === 'polygon' && points.length > 0 && (
+        <>
+          <Polygon positions={points} pathOptions={{ color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.2, weight: 2 }} />
+          {points.map((p, i) => (
+            <Circle key={i} center={p} radius={5} pathOptions={{ color: '#3b82f6', fillColor: '#fff', fillOpacity: 1, weight: 2 }} />
+          ))}
+        </>
+      )}
+      {mode === 'circle' && circle && (
+        <>
+          <Circle center={circle.center} radius={circle.radius || 10} pathOptions={{ color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.2, weight: 2 }} />
+          <Circle center={circle.center} radius={5} pathOptions={{ color: '#3b82f6', fillColor: '#fff', fillOpacity: 1, weight: 2 }} />
+        </>
+      )}
+    </>
+  );
 }
 
 const HOME_LOCATION = {
@@ -215,11 +270,60 @@ export default function App() {
         if (data.startPointId && data.startPointId !== 'HOME') ids.add(data.startPointId);
         if (data.endPointId && data.endPointId !== 'HOME') ids.add(data.endPointId);
       });
-      setVisitedStoreIds(ids);
+      setConfirmedPlannedStoreIds(ids);
     }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/plannedRoutes`));
 
     return () => unsubscribe();
   }, [user, isAuthReady]);
+
+  const [isRescheduling, setIsRescheduling] = useState<string | null>(null); // sourceDate
+
+  const rescheduleRoute = async (sourceDate: string, targetDate: string) => {
+    if (!user || !allPlannedRoutes[sourceDate]) return;
+    
+    if (allPlannedRoutes[targetDate]) {
+      if (!confirm(`A route already exists for ${targetDate}. Overwrite it?`)) return;
+    }
+
+    try {
+      const sourceRoute = allPlannedRoutes[sourceDate];
+      const routeData = {
+        uid: user.uid,
+        date: targetDate,
+        stops: sourceRoute.stops,
+        startPointId: sourceRoute.startPointId || 'HOME',
+        endPointId: sourceRoute.endPointId || 'HOME',
+        isConfirmed: true,
+        updatedAt: serverTimestamp()
+      };
+
+      // Add/Update target
+      const qTarget = query(
+        collection(db, `users/${user.uid}/plannedRoutes`),
+        where('date', '==', targetDate)
+      );
+      const snapshotTarget = await getDocs(qTarget);
+      if (snapshotTarget.empty) {
+        await addDoc(collection(db, `users/${user.uid}/plannedRoutes`), routeData);
+      } else {
+        await setDoc(doc(db, `users/${user.uid}/plannedRoutes`, snapshotTarget.docs[0].id), routeData, { merge: true });
+      }
+
+      // Delete source
+      const qSource = query(
+        collection(db, `users/${user.uid}/plannedRoutes`),
+        where('date', '==', sourceDate)
+      );
+      const snapshotSource = await getDocs(qSource);
+      if (!snapshotSource.empty) {
+        await deleteDoc(doc(db, `users/${user.uid}/plannedRoutes`, snapshotSource.docs[0].id));
+      }
+
+      setSelectedDate(targetDate);
+    } catch (error) {
+      console.error('Error rescheduling route:', error);
+    }
+  };
 
   const confirmRoute = async () => {
     if (user) {
@@ -380,10 +484,22 @@ export default function App() {
   const [routeGeometry, setRouteGeometry] = useState<[number, number][]>([]);
   const [routeStats, setRouteStats] = useState<{ distance: number; duration: number }[]>([]);
   const [isOptimizing, setIsOptimizing] = useState(false);
+  const [isReviewing, setIsReviewing] = useState(false);
   const [showOnlyClosest, setShowOnlyClosest] = useState(true);
   const [activeTab, setActiveTab] = useState<'PLANNER' | 'VISITED' | 'HISTORY' | 'ANALYTICS' | 'CALENDAR'>('PLANNER');
-  const [visitedStoreIds, setVisitedStoreIds] = useState<Set<string>>(new Set());
+  const [confirmedPlannedStoreIds, setConfirmedPlannedStoreIds] = useState<Set<string>>(new Set());
   const [routeHistory, setRouteHistory] = useState<any[]>([]);
+  const visitedStoreIds = useMemo(() => {
+    const ids = new Set<string>(confirmedPlannedStoreIds);
+    routeHistory.forEach(entry => {
+      if (entry.stopIds) {
+        entry.stopIds.forEach((id: string) => ids.add(id));
+      }
+      if (entry.startPointId && entry.startPointId !== 'HOME') ids.add(entry.startPointId);
+      if (entry.endPointId && entry.endPointId !== 'HOME') ids.add(entry.endPointId);
+    });
+    return ids;
+  }, [confirmedPlannedStoreIds, routeHistory]);
   const [isTracking, setIsTracking] = useState(false);
   const [trackingStartTime, setTrackingStartTime] = useState<number | null>(null);
   const [startTime, setStartTime] = useState('10:00');
@@ -396,6 +512,12 @@ export default function App() {
   const [showGasStations, setShowGasStations] = useState(false);
   const [gasStations, setGasStations] = useState<any[]>([]);
   const [isLoadingGas, setIsLoadingGas] = useState(false);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [mapLayer, setMapLayer] = useState<'standard' | 'satellite' | 'terrain'>('standard');
+  const [showLayerMenu, setShowLayerMenu] = useState(false);
+  const [drawingMode, setDrawingMode] = useState<'polygon' | 'circle' | null>(null);
+  const [drawPoints, setDrawPoints] = useState<[number, number][]>([]);
+  const [drawCircle, setDrawCircle] = useState<{ center: [number, number], radius: number } | null>(null);
   const [showReviewModal, setShowReviewModal] = useState(false);
   const [assignDate, setAssignDate] = useState(selectedDate);
   const [isRouteConfirmed, setIsRouteConfirmed] = useState(false);
@@ -404,12 +526,16 @@ export default function App() {
 
   const workingDays = useMemo(() => {
     const days = [];
-    let curr = new Date('2026-04-11');
-    const end = new Date('2026-05-29');
+    // Use local time for calculation to avoid timezone shifts with getDay()
+    let curr = new Date(2026, 3, 11); // April 11, 2026
+    const end = new Date(2026, 4, 29); // May 29, 2026
     
     while (curr <= end) {
       const day = curr.getDay();
-      const dateStr = curr.toISOString().split('T')[0];
+      const y = curr.getFullYear();
+      const m = String(curr.getMonth() + 1).padStart(2, '0');
+      const d = String(curr.getDate()).padStart(2, '0');
+      const dateStr = `${y}-${m}-${d}`;
       
       // April 11 (Sat) and 12 (Sun) are exceptions
       if (dateStr === '2026-04-11' || dateStr === '2026-04-12') {
@@ -527,11 +653,48 @@ export default function App() {
         currentPos = HOME_LOCATION; // Reset to home for next day
         if (unvisited.length === 0) break;
       }
-      
-      alert(`Successfully scheduled ${locations.length - unvisited.length} stores across ${Object.keys(schedule).length} days.`);
     } catch (err) {
       console.error(err);
-      alert("Error during auto-scheduling.");
+    } finally {
+      setIsOptimizing(false);
+    }
+  };
+
+  const selectEnclosedStores = () => {
+    if (drawingMode === 'polygon' && drawPoints.length >= 3) {
+      const polygon = drawPoints.map(p => [p[1], p[0]]); // [lng, lat] for point-in-polygon
+      const enclosed = locations.filter(loc => {
+        return inside([loc.lng, loc.lat], polygon);
+      });
+      const newIds = new Set(selectedIds);
+      enclosed.forEach(loc => newIds.add(loc.id));
+      setSelectedIds(newIds);
+    } else if (drawingMode === 'circle' && drawCircle) {
+      const enclosed = locations.filter(loc => {
+        const dist = L.latLng(drawCircle.center).distanceTo([loc.lat, loc.lng]);
+        return dist <= drawCircle.radius;
+      });
+      const newIds = new Set(selectedIds);
+      enclosed.forEach(loc => newIds.add(loc.id));
+      setSelectedIds(newIds);
+    }
+    setDrawingMode(null);
+    setDrawPoints([]);
+    setDrawCircle(null);
+  };
+
+  const clearAllSchedules = async () => {
+    if (!user) return;
+    
+    setIsOptimizing(true);
+    setShowClearConfirm(false);
+    try {
+      const q = query(collection(db, `users/${user.uid}/plannedRoutes`));
+      const snap = await getDocs(q);
+      const deletePromises = snap.docs.map(d => deleteDoc(doc(db, `users/${user.uid}/plannedRoutes`, d.id)));
+      await Promise.all(deletePromises);
+    } catch (err) {
+      console.error(err);
     } finally {
       setIsOptimizing(false);
     }
@@ -549,9 +712,21 @@ export default function App() {
           <div className="flex items-center justify-between mb-8">
             <div>
               <h2 className="text-3xl font-black text-neutral-900 tracking-tight">Visit Calendar</h2>
-              <p className="text-neutral-500 font-medium">April 11 - May 29, 2026 • Washington Market</p>
+              {isRescheduling ? (
+                <p className="text-blue-600 font-bold animate-pulse">Select a new date for the route from {isRescheduling}</p>
+              ) : (
+                <p className="text-neutral-500 font-medium">April 11 - May 29, 2026 • Washington Market</p>
+              )}
             </div>
             <div className="flex gap-3">
+              {isRescheduling && (
+                <button 
+                  onClick={() => setIsRescheduling(null)}
+                  className="px-6 py-3 bg-neutral-100 text-neutral-600 rounded-2xl font-bold transition-all"
+                >
+                  Cancel Move
+                </button>
+              )}
               <button 
                 onClick={autoSchedule}
                 disabled={isOptimizing}
@@ -560,6 +735,45 @@ export default function App() {
                 {isOptimizing ? <Sparkles className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
                 Auto-Schedule All Stores
               </button>
+              {Object.keys(allPlannedRoutes).length > 0 && (
+                <div className="relative">
+                  <button 
+                    onClick={() => setShowClearConfirm(!showClearConfirm)}
+                    disabled={isOptimizing}
+                    className="px-6 py-3 bg-white border-2 border-neutral-200 hover:border-red-200 hover:bg-red-50 text-neutral-600 hover:text-red-600 rounded-2xl font-bold transition-all flex items-center gap-2 disabled:opacity-50"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    Clear All
+                  </button>
+                  
+                  <AnimatePresence>
+                    {showClearConfirm && (
+                      <motion.div 
+                        initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                        className="absolute top-full right-0 mt-2 w-64 bg-white rounded-2xl shadow-2xl border border-neutral-100 p-4 z-50"
+                      >
+                        <p className="text-xs font-bold text-neutral-900 mb-3">Clear all scheduled routes?</p>
+                        <div className="flex gap-2">
+                          <button 
+                            onClick={clearAllSchedules}
+                            className="flex-1 py-2 bg-red-600 text-white rounded-xl text-[10px] font-bold hover:bg-red-700 transition-all"
+                          >
+                            Yes, Clear
+                          </button>
+                          <button 
+                            onClick={() => setShowClearConfirm(false)}
+                            className="flex-1 py-2 bg-neutral-100 text-neutral-600 rounded-xl text-[10px] font-bold hover:bg-neutral-200 transition-all"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              )}
             </div>
           </div>
 
@@ -591,15 +805,24 @@ export default function App() {
                         <div 
                           key={dateStr}
                           onClick={() => {
+                            if (isRescheduling) {
+                              if (isWorking) {
+                                rescheduleRoute(isRescheduling, dateStr);
+                                setIsRescheduling(null);
+                              }
+                              return;
+                            }
                             setSelectedDate(dateStr);
-                            if (isWorking) setActiveTab('PLANNER');
+                            if (isWorking && route) setActiveTab('PLANNER');
                           }}
                           className={cn(
                             "aspect-square rounded-2xl border-2 flex flex-col items-center justify-center gap-1 transition-all cursor-pointer relative group",
                             isSelected ? "border-blue-600 bg-blue-50 shadow-md scale-105 z-10" : "border-transparent hover:border-neutral-200",
                             !isWorking && "opacity-30 grayscale cursor-not-allowed",
                             isWorking && !route && "bg-neutral-50",
-                            route && "bg-blue-600 text-white border-blue-600"
+                            route && "bg-blue-600 text-white border-blue-600",
+                            isRescheduling === dateStr && "ring-4 ring-blue-400 ring-offset-2",
+                            isRescheduling && isWorking && isRescheduling !== dateStr && "hover:bg-blue-50 hover:border-blue-300"
                           )}
                         >
                           <span className={cn("text-sm font-bold", route ? "text-white" : "text-neutral-700")}>{day}</span>
@@ -612,6 +835,18 @@ export default function App() {
                                 ))}
                               </div>
                             </div>
+                          )}
+                          {route && !isRescheduling && (
+                            <button 
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setIsRescheduling(dateStr);
+                              }}
+                              className="absolute -top-2 -right-2 p-1.5 bg-white text-blue-600 rounded-lg shadow-lg opacity-0 group-hover:opacity-100 transition-all border border-neutral-100"
+                              title="Move Route"
+                            >
+                              <ArrowRightLeft className="w-3 h-3" />
+                            </button>
                           )}
                           {isSelected && (
                             <motion.div 
@@ -732,7 +967,7 @@ export default function App() {
     setIsOptimizing(true);
     
     // Use selected start and end points
-    const fullRoute = [startPoint, ...plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint];
+    const fullRoute = [startPoint, ...plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint].filter(Boolean);
     const coords = fullRoute.map(l => `${l.lng},${l.lat}`).join(';');
     
     try {
@@ -771,7 +1006,7 @@ export default function App() {
   const fetchRoute = async (skipNav = false) => {
     if (plannedRoute.length < 1) return;
     
-    const fullRoute = [startPoint, ...plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint];
+    const fullRoute = [startPoint, ...plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint].filter(Boolean);
     const coords = fullRoute.map(l => `${l.lng},${l.lat}`).join(';');
     
     try {
@@ -805,8 +1040,8 @@ export default function App() {
   };
 
   const calculateETA = (index: number) => {
-    const [startH, startM] = startTime.split(':').map(Number);
-    const [endH, endM] = endTime.split(':').map(Number);
+    const [startH, startM] = (startTime || '10:00').split(':').map(Number);
+    const [endH, endM] = (endTime || '18:00').split(':').map(Number);
     
     const fullRoute = [startPoint, ...plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint].filter(Boolean);
     
@@ -954,10 +1189,7 @@ export default function App() {
     return [38.8654, -76.9448]; // Home
   }, [selectedLocation, plannedRoute]);
 
-  const mapZoom = useMemo(() => {
-    if (selectedLocation) return 15;
-    return 12;
-  }, [selectedLocation]);
+  const mapZoom = 12;
 
   const exportToCSV = () => {
     const headers = ["Date", "Stops", "Total Miles", "Total Duration (min)"];
@@ -988,6 +1220,9 @@ export default function App() {
       uid: user?.uid,
       date: selectedDate,
       stops: plannedRoute.length,
+      stopIds: plannedRoute.map(s => s.id),
+      startPointId: startPoint?.id,
+      endPointId: endPoint?.id,
       miles: totalMiles,
       duration: totalDuration,
       timestamp: serverTimestamp()
@@ -1021,8 +1256,8 @@ export default function App() {
     <div className="flex h-screen bg-neutral-50 font-sans text-neutral-900 overflow-hidden">
       {/* Sidebar */}
       <div className="w-96 flex flex-col border-r border-neutral-200 bg-white z-10 shadow-xl overflow-hidden">
-        <div className="p-6 border-bottom border-neutral-100 shrink-0">
-          <div className="flex items-center justify-between mb-6">
+        <div className="p-6 border-bottom border-neutral-100 shrink-0 w-[300px] h-[87px] pl-[11px] pt-[13px] pr-[3px] pb-0">
+          <div className="flex items-center justify-between mb-6 w-[243px] h-[38px] mb-[11px]">
             <div className="flex items-center gap-2">
               <div className="p-2 bg-blue-600 rounded-lg">
                 <Navigation className="w-6 h-6 text-white" />
@@ -1042,7 +1277,7 @@ export default function App() {
                   <LogIn className="w-4 h-4" />
                 </button>
               )}
-              <div className="flex bg-neutral-100 p-1 rounded-xl">
+              <div className="flex bg-neutral-100 p-1 rounded-xl w-[165px] pr-[38px] pt-[2px] mt-[70px] mr-[33px] h-[34px] mb-[-8px]">
                 <button 
                   onClick={() => setActiveTab('CALENDAR')}
                   className={cn("p-2 rounded-lg transition-all", activeTab === 'CALENDAR' ? "bg-white shadow-sm text-blue-600" : "text-neutral-400")}
@@ -1548,14 +1783,32 @@ export default function App() {
               {plannedRoute.length > 0 && (
                 <button 
                   onClick={async () => {
-                    await fetchRoute();
-                    setAssignDate(selectedDate);
-                    setShowReviewModal(true);
+                    setIsReviewing(true);
+                    try {
+                      await fetchRoute(true);
+                      setAssignDate(selectedDate);
+                      setShowReviewModal(true);
+                    } finally {
+                      setIsReviewing(false);
+                    }
                   }}
-                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg transition-all text-xs font-bold flex items-center gap-1"
+                  disabled={isReviewing}
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg transition-all text-xs font-bold flex items-center gap-1 disabled:opacity-50"
                 >
-                  <CheckCircle2 className="w-3 h-3" />
-                  Review & Confirm
+                  {isReviewing ? <Sparkles className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+                  {isReviewing ? 'Loading...' : 'Review & Confirm'}
+                </button>
+              )}
+              {isRouteConfirmed && (
+                <button 
+                  onClick={() => {
+                    setActiveTab('CALENDAR');
+                    setIsRescheduling(selectedDate);
+                  }}
+                  className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg transition-all text-blue-400"
+                  title="Reschedule Route"
+                >
+                  <ArrowRightLeft className="w-4 h-4" />
                 </button>
               )}
               {plannedRoute.length > 2 && (
@@ -1838,11 +2091,31 @@ export default function App() {
           zoomControl={false}
         >
           <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            attribution={
+              mapLayer === 'satellite' 
+                ? 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EBP, and the GIS User Community'
+                : mapLayer === 'terrain'
+                ? '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://opentopomap.org">OpenTopoMap</a>'
+                : '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            }
+            url={
+              mapLayer === 'satellite'
+                ? "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                : mapLayer === 'terrain'
+                ? "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png"
+                : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            }
           />
           
           <MapUpdater center={centerPosition} zoom={mapZoom} />
+          
+          <DrawingLayer 
+            mode={drawingMode} 
+            points={drawPoints} 
+            setPoints={setDrawPoints} 
+            circle={drawCircle} 
+            setCircle={setDrawCircle} 
+          />
 
           <Marker position={[HOME_LOCATION.lat, HOME_LOCATION.lng]} icon={homeIcon} />
 
@@ -1875,7 +2148,7 @@ export default function App() {
               const isSelected = selectedLocation?.id === loc.id;
               const isVisited = visitedStoreIds.has(loc.id);
               
-              let color = '#ef4444'; // Default red
+              let color = loc.carrier === 'T-MOBILE' ? '#e20074' : '#6a0dad'; // Magenta for T-Mobile, Purple for Metro
               if (isVisited) color = '#10b981'; // Visited green (checked off)
               if (isInRoute) color = '#3b82f6'; // Planned blue
               if (isSelected) color = '#10b981'; // Selected green
@@ -1895,7 +2168,32 @@ export default function App() {
                       addToRoute(loc);
                     }
                   }}
-                />
+                >
+                  <LeafletTooltip direction="top" offset={[0, -30]} opacity={1} permanent={false}>
+                    <div className="p-2 min-w-[150px]">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className={cn(
+                          "text-[8px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider",
+                          loc.carrier === 'T-MOBILE' ? "bg-pink-100 text-pink-700" : "bg-purple-100 text-purple-700"
+                        )}>
+                          {loc.carrier}
+                        </span>
+                        <span className="text-[9px] font-bold text-neutral-400">ID: {loc.id}</span>
+                      </div>
+                      <h4 className="text-xs font-bold text-neutral-800 leading-tight mb-1">{loc.address}</h4>
+                      <div className="flex items-center gap-1 text-[10px] text-neutral-500">
+                        <MapPin className="w-3 h-3" />
+                        <span>{loc.city}, {loc.state}</span>
+                      </div>
+                      {isInRoute && (
+                        <div className="mt-2 pt-2 border-t border-neutral-100 flex items-center gap-1 text-[9px] font-bold text-blue-600 uppercase">
+                          <Navigation className="w-3 h-3" />
+                          <span>Stop #{routeIndex + 1}</span>
+                        </div>
+                      )}
+                    </div>
+                  </LeafletTooltip>
+                </Marker>
               );
             })}
 
@@ -1919,14 +2217,66 @@ export default function App() {
         )}
 
         {/* Floating Controls */}
-        <div className="absolute top-6 right-6 flex flex-col gap-2 z-[1000]">
+        <div className="absolute top-6 right-6 flex flex-col gap-3 z-[1000]">
+          <div className="relative">
+            <button 
+              onClick={() => setShowLayerMenu(!showLayerMenu)}
+              className={cn(
+                "p-4 rounded-2xl shadow-xl transition-all flex items-center justify-center border border-neutral-200",
+                showLayerMenu ? "bg-blue-600 text-white" : "bg-white text-neutral-600 hover:bg-neutral-50"
+              )}
+              title="Map Layers"
+            >
+              <Layers className="w-6 h-6" />
+            </button>
+            
+            <AnimatePresence>
+              {showLayerMenu && (
+                <motion.div 
+                  initial={{ opacity: 0, x: -20, scale: 0.95 }}
+                  animate={{ opacity: 1, x: 0, scale: 1 }}
+                  exit={{ opacity: 0, x: -20, scale: 0.95 }}
+                  className="absolute top-0 right-full mr-3 w-40 bg-white rounded-2xl shadow-2xl border border-neutral-100 p-2 overflow-hidden"
+                >
+                  <button 
+                    onClick={() => { setMapLayer('standard'); setShowLayerMenu(false); }}
+                    className={cn(
+                      "w-full px-4 py-2.5 rounded-xl text-xs font-bold text-left transition-all",
+                      mapLayer === 'standard' ? "bg-blue-50 text-blue-600" : "text-neutral-600 hover:bg-neutral-50"
+                    )}
+                  >
+                    Standard
+                  </button>
+                  <button 
+                    onClick={() => { setMapLayer('satellite'); setShowLayerMenu(false); }}
+                    className={cn(
+                      "w-full px-4 py-2.5 rounded-xl text-xs font-bold text-left transition-all",
+                      mapLayer === 'satellite' ? "bg-blue-50 text-blue-600" : "text-neutral-600 hover:bg-neutral-50"
+                    )}
+                  >
+                    Satellite
+                  </button>
+                  <button 
+                    onClick={() => { setMapLayer('terrain'); setShowLayerMenu(false); }}
+                    className={cn(
+                      "w-full px-4 py-2.5 rounded-xl text-xs font-bold text-left transition-all",
+                      mapLayer === 'terrain' ? "bg-blue-50 text-blue-600" : "text-neutral-600 hover:bg-neutral-50"
+                    )}
+                  >
+                    Terrain
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
           <div className="bg-white p-2 rounded-2xl shadow-xl border border-neutral-200 flex flex-col gap-1">
             <button className="p-3 hover:bg-neutral-100 rounded-xl transition-all text-neutral-600">
               <Plus className="w-5 h-5" />
             </button>
             <div className="h-px bg-neutral-100 mx-2" />
             <button className="p-3 hover:bg-neutral-100 rounded-xl transition-all text-neutral-600">
-              <Circle className="w-5 h-5" />
+              <CircleIcon className="w-5 h-5" />
             </button>
           </div>
           
@@ -1940,6 +2290,58 @@ export default function App() {
           >
             <Navigation className="w-6 h-6" />
           </button>
+
+          <div className="h-px bg-neutral-100 mx-2" />
+
+          <div className="flex flex-col gap-2">
+            <button 
+              onClick={() => {
+                if (drawingMode === 'polygon') {
+                  setDrawingMode(null);
+                  setDrawPoints([]);
+                } else {
+                  setDrawingMode('polygon');
+                  setDrawCircle(null);
+                }
+              }}
+              className={cn(
+                "p-4 rounded-2xl shadow-xl transition-all flex items-center justify-center border border-neutral-200",
+                drawingMode === 'polygon' ? "bg-blue-600 text-white" : "bg-white text-neutral-600 hover:bg-neutral-50"
+              )}
+              title="Draw Polygon Selection"
+            >
+              <SquareIcon className="w-6 h-6" />
+            </button>
+            
+            <button 
+              onClick={() => {
+                if (drawingMode === 'circle') {
+                  setDrawingMode(null);
+                  setDrawCircle(null);
+                } else {
+                  setDrawingMode('circle');
+                  setDrawPoints([]);
+                }
+              }}
+              className={cn(
+                "p-4 rounded-2xl shadow-xl transition-all flex items-center justify-center border border-neutral-200",
+                drawingMode === 'circle' ? "bg-blue-600 text-white" : "bg-white text-neutral-600 hover:bg-neutral-50"
+              )}
+              title="Draw Circle Selection"
+            >
+              <CircleIcon className="w-6 h-6" />
+            </button>
+
+            {drawingMode && (
+              <button 
+                onClick={selectEnclosedStores}
+                className="p-4 rounded-2xl shadow-xl bg-green-600 text-white transition-all flex items-center justify-center animate-bounce border border-green-500"
+                title="Confirm Selection"
+              >
+                <Check className="w-6 h-6" />
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Review Modal */}
@@ -1999,8 +2401,8 @@ export default function App() {
                         <p className="text-[9px] text-blue-600 font-bold">Dep: {calculateETA(0).departure}</p>
                       </div>
                     </div>
-                    {plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, i) => {
-                      const originalIndex = plannedRoute.findIndex(l => l.id === loc.id);
+                    {plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, i) => {
+                      const originalIndex = plannedRoute.findIndex(l => l && l.id === loc.id);
                       return (
                         <div key={loc.id} className="flex items-center gap-3 p-2 bg-neutral-50 rounded-xl group">
                           <div className="w-5 h-5 rounded-full bg-neutral-200 flex items-center justify-center text-[10px] font-bold text-neutral-600">{i + 2}</div>
@@ -2026,7 +2428,7 @@ export default function App() {
                                 await moveInRoute(originalIndex, 'down');
                                 await fetchRoute(true);
                               }}
-                              disabled={i === plannedRoute.filter(l => l?.id !== startPoint?.id && l?.id !== endPoint?.id).length - 1}
+                              disabled={i === plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).length - 1}
                               className="p-1 text-neutral-400 hover:text-blue-500 disabled:opacity-30"
                             >
                               <ChevronDown className="w-3 h-3" />
@@ -2036,10 +2438,14 @@ export default function App() {
                       );
                     })}
                     <div className="flex items-center gap-3 p-2 bg-blue-50 rounded-xl">
-                      <div className="w-5 h-5 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white">{plannedRoute.length + 2}</div>
+                      <div className="w-5 h-5 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white">
+                        {plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).length + 2}
+                      </div>
                       <div className="flex-1 min-w-0">
-                        <p className="text-xs font-medium truncate">{endPoint.address}</p>
-                        <p className="text-[9px] text-blue-600 font-bold">Arr: {calculateETA(plannedRoute.length + 1).arrival}</p>
+                        <p className="text-xs font-medium truncate">{endPoint?.address || 'Home'}</p>
+                        <p className="text-[9px] text-blue-600 font-bold">
+                          Arr: {calculateETA(plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).length + 1).arrival}
+                        </p>
                       </div>
                     </div>
                   </div>

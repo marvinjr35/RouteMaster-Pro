@@ -115,5 +115,10 @@ service cloud.firestore {
         allow delete: if isOwner(userId);
       }
     }
+
+    // Connection Test Path
+    match /test/connection {
+      allow read: if true;
+    }
   }
 }
