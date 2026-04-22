@@ -35,7 +35,11 @@ import {
   Circle as CircleIcon,
   Check,
   GripVertical,
-  AlertCircle
+  AlertCircle,
+  Download,
+  WifiOff,
+  Database,
+  Trash
 } from 'lucide-react';
 import { locations, Location } from './data';
 import { cn } from './lib/utils';
@@ -43,7 +47,8 @@ import { auth, signInWithGoogle, logout, db, handleFirestoreError, OperationType
 import { onAuthStateChanged, User } from 'firebase/auth';
 import { collection, doc, setDoc, getDoc, onSnapshot, query, where, serverTimestamp, addDoc, deleteDoc, getDocs } from 'firebase/firestore';
 import { geminiFlash, geminiProThinking } from './gemini';
-import { LogOut, LogIn, MessageSquare, Send, Sparkles, X } from 'lucide-react';
+import { LogOut, LogIn, MessageSquare, Send, Sparkles, X, CloudDownload, Info } from 'lucide-react';
+import { getAllAreas, saveAreaMetadata, getTilesInBounds, downloadTile, OfflineArea, deleteArea, getTile } from './lib/offlineMap';
 
 // Fix Leaflet marker icons
 // @ts-ignore
@@ -53,6 +58,47 @@ L.Icon.Default.mergeOptions({
   iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
   shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
 });
+
+// Custom Offline TileLayer
+const OfflineTileLayer = ({ url, attribution, activeLayer }: { url: string; attribution: string; activeLayer: string }) => {
+  const map = useMap();
+  
+  useEffect(() => {
+    // @ts-ignore
+    const OfflineLayer = L.TileLayer.extend({
+      createTile: function (coords: L.Coords, done: L.DoneCallback) {
+        const tile = document.createElement('img');
+        const tileUrl = this.getTileUrl(coords);
+        
+        getTile(tileUrl).then(blob => {
+          if (blob) {
+            const objUrl = URL.createObjectURL(blob);
+            tile.src = objUrl;
+            tile.onload = () => {
+              URL.revokeObjectURL(objUrl);
+              done(null, tile);
+            };
+          } else {
+            tile.src = tileUrl;
+            tile.onload = () => done(null, tile);
+            tile.onerror = () => done(new Error('Offline tile missing'), tile);
+          }
+        });
+        return tile;
+      }
+    });
+
+    // @ts-ignore
+    const layer = new OfflineLayer(url, { attribution });
+    layer.addTo(map);
+
+    return () => {
+      map.removeLayer(layer);
+    };
+  }, [map, url, attribution, activeLayer]);
+
+  return null;
+};
 
 // Custom marker icons
 const createMarkerIcon = (color: string, isPlanned: boolean, number?: number, isSelected?: boolean) => {
@@ -429,20 +475,30 @@ export default function App() {
     }
   };
 
+  const [trafficIncidents, setTrafficIncidents] = useState<{description: string, lat: number, lng: number}[]>([]);
   const fetchTrafficData = async () => {
     try {
-      const prompt = "What are the current traffic conditions and any major accidents or delays in the Washington DC and surrounding Maryland/Virginia areas right now? Provide a concise summary of major bottlenecks. Also, provide a single number representing the overall traffic delay multiplier (e.g., 1.0 for normal, 1.5 for heavy traffic). Format: Alerts: [list] Multiplier: [number]";
-      const response = await geminiFlash(prompt, "You are a traffic reporter for the Washington DC area. Provide concise alerts and a numeric multiplier.");
-      const text = response.text || "";
-      const alertsMatch = text.match(/Alerts:([\s\S]*?)Multiplier:/i);
-      const multiplierMatch = text.match(/Multiplier:\s*([\d.]+)/i);
+      const prompt = `What are the current traffic conditions and any major accidents or delays in the Washington DC area right now? 
+      Provide a concise list of major incidents. 
+      For each incident, provide a short description and approximate latitude and longitude coordinates within the DC area.
+      Also, provide a single number representing the overall traffic delay multiplier (1.0 to 2.0). 
+      Format strictly as JSON: 
+      {
+        "alerts": [{"description": "string", "lat": number, "lng": number}],
+        "multiplier": number
+      }`;
       
-      if (alertsMatch) {
-        const alerts = alertsMatch[1].split('\n').filter(line => line.trim().length > 10).slice(0, 3);
-        setTrafficAlerts(alerts);
+      const response = await geminiFlash(prompt, "You are a traffic data parser. Output ONLY valid JSON.");
+      const text = response.text || "{}";
+      const cleanedJson = text.replace(/```json|```/g, "").trim();
+      const data = JSON.parse(cleanedJson);
+      
+      if (data.alerts) {
+        setTrafficIncidents(data.alerts);
+        setTrafficAlerts(data.alerts.map((a: any) => a.description));
       }
-      if (multiplierMatch) {
-        setTrafficMultiplier(parseFloat(multiplierMatch[1]) || 1.0);
+      if (data.multiplier) {
+        setTrafficMultiplier(Math.max(1, data.multiplier));
       }
     } catch (error) {
       console.error("Traffic fetch error:", error);
@@ -488,7 +544,7 @@ export default function App() {
   const [isOptimizing, setIsOptimizing] = useState(false);
   const [isReviewing, setIsReviewing] = useState(false);
   const [showOnlyClosest, setShowOnlyClosest] = useState(true);
-  const [activeTab, setActiveTab] = useState<'PLANNER' | 'VISITED' | 'HISTORY' | 'ANALYTICS' | 'CALENDAR'>('PLANNER');
+  const [activeTab, setActiveTab] = useState<'PLANNER' | 'VISITED' | 'HISTORY' | 'ANALYTICS' | 'CALENDAR' | 'OFFLINE'>('PLANNER');
   const [confirmedPlannedStoreIds, setConfirmedPlannedStoreIds] = useState<Set<string>>(new Set());
   const [routeHistory, setRouteHistory] = useState<any[]>([]);
   const visitedStoreIds = useMemo(() => {
@@ -525,6 +581,42 @@ export default function App() {
   const [isRouteConfirmed, setIsRouteConfirmed] = useState(false);
   const [expandedCluster, setExpandedCluster] = useState<string | null>(null);
   const [showCalendar, setShowCalendar] = useState(false);
+  const [offlineAreas, setOfflineAreas] = useState<OfflineArea[]>([]);
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [offlineStatus, setOfflineStatus] = useState<'online' | 'offline'>('online');
+  const [planningAlert, setPlanningAlert] = useState<string | null>(null);
+  const [isRouteSummaryMinimized, setIsRouteSummaryMinimized] = useState(false);
+
+  useEffect(() => {
+    const loadAreas = async () => {
+      const areas = await getAllAreas();
+      setOfflineAreas(areas);
+    };
+    loadAreas();
+    
+    // Simple online/offline detection
+    const handleOnline = () => setOfflineStatus('online');
+    const handleOffline = () => setOfflineStatus('offline');
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (plannedRoute.length > 0) {
+      checkOfflineValidity([
+        { lat: startPoint.lat, lng: startPoint.lng },
+        ...plannedRoute.map(p => ({ lat: p.lat, lng: p.lng })),
+        { lat: endPoint.lat, lng: endPoint.lng }
+      ]);
+    } else {
+      setPlanningAlert(null);
+    }
+  }, [plannedRoute, startPoint, endPoint, offlineAreas]);
 
   const workingDays = useMemo(() => {
     const days = [];
@@ -1038,7 +1130,133 @@ export default function App() {
       }
     } catch (error) {
       console.error('Error fetching route:', error);
+      // OFFLINE FALLBACK: Direct lines
+      const fallbackGeometry: [number, number][] = fullRoute.map(l => [l.lat, l.lng]);
+      setRouteGeometry(fallbackGeometry);
+      setInstructions([{ instruction: "Offline Mode: Showing direct lines between stops.", distance: 0, name: "Direct Path" }]);
+      
+      const fallbackStats = [];
+      for(let i=0; i<fullRoute.length-1; i++) {
+        const d = calculateDistance(fullRoute[i].lat, fullRoute[i].lng, fullRoute[i+1].lat, fullRoute[i+1].lng);
+        fallbackStats.push({ distance: d, duration: d / 12 }); // Approx 30mph
+      }
+      setRouteStats(fallbackStats);
+      
+      if (!skipNav) {
+        setIsNavigating(true);
+      }
     }
+  };
+
+  const checkOfflineValidity = (points: { lat: number; lng: number }[]) => {
+    if (offlineAreas.length === 0) return true;
+    
+    // Check if each point is in at least one downloaded area
+    const invalidPoints = points.filter(p => {
+      const point = [p.lat, p.lng] as [number, number];
+      return !offlineAreas.some(area => {
+        if (area.geojson) {
+          return inside(point, area.geojson);
+        }
+        // Fallback to bounds if no geojson
+        return p.lat <= area.bounds[0][0] && p.lat >= area.bounds[1][0] &&
+               p.lng >= area.bounds[0][1] && p.lng <= area.bounds[1][1];
+      });
+    });
+
+    if (invalidPoints.length > 0) {
+      setPlanningAlert(`Warning: ${invalidPoints.length} stop(s) are in areas without offline map data. Navigation may fail if you go offline.`);
+      return false;
+    }
+    setPlanningAlert(null);
+    return true;
+  };
+
+  const handleDownloadArea = async () => {
+    if ((drawPoints.length < 3 && !drawCircle) || isDownloading) return;
+    
+    setIsDownloading(true);
+    setDownloadProgress(0);
+    
+    try {
+      const areaId = Math.random().toString(36).substring(7);
+      let bounds: L.LatLngBounds;
+      let geojson: any = null;
+
+      if (drawCircle) {
+        const circle = L.circle(drawCircle.center, { radius: drawCircle.radius });
+        bounds = circle.getBounds();
+        // Approximation of circle for inside check
+        geojson = []; // Simplified for this demo
+      } else {
+        const polygon = L.polygon(drawPoints);
+        bounds = polygon.getBounds();
+        geojson = drawPoints;
+      }
+
+      const urlTemplate = mapLayer === 'satellite' 
+        ? "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        : mapLayer === 'terrain'
+        ? "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png"
+        : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
+
+      // Zoom levels to download (e.g., 10 to 15 for a good balance)
+      const minZ = 10;
+      const maxZ = 15;
+      const tiles = getTilesInBounds(bounds, minZ, maxZ);
+      
+      const total = tiles.length;
+      let downloaded = 0;
+
+      // Download in batches to avoid overwhelming the browser
+      const batchSize = 10;
+      for (let i = 0; i < tiles.length; i += batchSize) {
+        const batch = tiles.slice(i, i + batchSize);
+        await Promise.all(batch.map(async tile => {
+          // Replace {s} {x} {y} {z} in template
+          const s = ['a', 'b', 'c'][Math.floor(Math.random() * 3)];
+          const url = urlTemplate
+            .replace('{s}', s)
+            .replace('{x}', tile.x.toString())
+            .replace('{y}', tile.y.toString())
+            .replace('{z}', tile.z.toString());
+          
+          await downloadTile(url);
+          downloaded++;
+          setDownloadProgress(Math.round((downloaded / total) * 100));
+        }));
+      }
+
+      const newArea: OfflineArea = {
+        id: areaId,
+        name: `Area ${offlineAreas.length + 1}`,
+        bounds: [[bounds.getNorth(), bounds.getWest()], [bounds.getSouth(), bounds.getEast()]],
+        zoomRange: [minZ, maxZ],
+        tileCount: total,
+        sizeMB: parseFloat((total * 0.05).toFixed(2)), // Approx 50KB per tile
+        date: new Date().toISOString(),
+        geojson
+      };
+
+      await saveAreaMetadata(newArea);
+      setOfflineAreas(prev => [...prev, newArea]);
+      setDrawPoints([]);
+      setDrawCircle(null);
+      setDrawingMode(null);
+      alert('Area downloaded successfully!');
+    } catch (error) {
+      console.error('Download failed:', error);
+      alert('Failed to download area. Check your connection.');
+    } finally {
+      setIsDownloading(false);
+      setDownloadProgress(0);
+    }
+  };
+
+  const handleDeleteArea = async (id: string) => {
+    if (!confirm('Are you sure you want to delete this offline area?')) return;
+    await deleteArea(id, "");
+    setOfflineAreas(prev => prev.filter(a => a.id !== id));
   };
 
   const calculateETA = (index: number) => {
@@ -1194,15 +1412,41 @@ export default function App() {
   const mapZoom = 12;
 
   const exportToCSV = () => {
-    const headers = ["Date", "Stops", "Total Miles", "Total Duration (min)"];
-    const rows = routeHistory.map(r => [
-      r.date,
-      r.stops,
-      r.miles.toFixed(2),
-      Math.round(r.duration / 60)
-    ]);
+    const headers = ["Date", "Stops Count", "Total Miles", "Duration (min)", "Visited Stops"];
     
-    const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
+    const rows = routeHistory.map(r => {
+      // Resolve addresses for all stops in the route
+      const getAddress = (id: string) => {
+        if (id === 'HOME') return HOME_LOCATION.address;
+        const loc = locations.find(l => l.id === id);
+        return loc ? loc.address : id;
+      };
+
+      const startAddr = getAddress(r.startPointId);
+      const endAddr = getAddress(r.endPointId);
+      const stopsAddrs = (r.stopIds || []).map((id: string) => getAddress(id));
+
+      // Construct the full stop sequence
+      const fullSequence = [
+        `START: ${startAddr}`,
+        ...stopsAddrs,
+        `END: ${endAddr}`
+      ].join(" -> ");
+
+      return [
+        r.date,
+        r.stops,
+        r.miles.toFixed(2),
+        Math.round(r.duration / 60),
+        fullSequence
+      ];
+    });
+    
+    // Properly escape CSV fields that might contain commas or quotes
+    const csvContent = [headers, ...rows]
+      .map(row => row.map(field => `"${String(field).replace(/"/g, '""')}"`).join(","))
+      .join("\n");
+
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement("a");
     const url = URL.createObjectURL(blob);
@@ -1311,8 +1555,16 @@ export default function App() {
                 <button 
                   onClick={() => setActiveTab('ANALYTICS')}
                   className={cn("p-2 rounded-lg transition-all", activeTab === 'ANALYTICS' ? "bg-white shadow-sm text-blue-600" : "text-neutral-400")}
+                  title="Analytics"
                 >
                   <Filter className="w-4 h-4" />
+                </button>
+                <button 
+                  onClick={() => setActiveTab('OFFLINE')}
+                  className={cn("p-2 rounded-lg transition-all", activeTab === 'OFFLINE' ? "bg-white shadow-sm text-blue-600" : "text-neutral-400")}
+                  title="Offline Maps"
+                >
+                  <Database className="w-4 h-4" />
                 </button>
               </div>
             </div>
@@ -1461,7 +1713,7 @@ export default function App() {
                         checked={showTrafficLayer}
                         onChange={(e) => setShowTrafficLayer(e.target.checked)}
                       />
-                      <span className="text-[10px] text-neutral-600 group-hover:text-neutral-900 transition-colors">Traffic Alerts</span>
+                      <span className="text-[10px] text-neutral-600 group-hover:text-neutral-900 transition-colors">Traffic Layer & Alerts</span>
                     </label>
                   </div>
                   {(avoidTolls || avoidTraffic || showTrafficLayer) && (
@@ -1641,7 +1893,7 @@ export default function App() {
                   onClick={exportToCSV}
                   className="text-[10px] font-bold text-blue-600 hover:underline flex items-center gap-1"
                 >
-                  <Plus className="w-3 h-3 rotate-45" /> Export CSV
+                  <Download className="w-4 h-4" /> Export CSV
                 </button>
               </div>
               {routeHistory.map(route => (
@@ -1766,305 +2018,404 @@ export default function App() {
               </div>
             </div>
           )}
-        </div>
 
-        {/* Planned Route Summary */}
-        <div className="h-[250px] p-6 bg-neutral-900 text-white shrink-0">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <Calendar className="w-5 h-5 text-blue-400" />
-              <h2 className="font-bold">Today's Route</h2>
-              {isRouteConfirmed && (
-                <span className="ml-2 px-2 py-0.5 bg-green-500/20 text-green-400 text-[10px] font-bold rounded uppercase tracking-wider flex items-center gap-1">
-                  <CheckCircle2 className="w-3 h-3" />
-                  Confirmed
-                </span>
-              )}
-            </div>
-            <div className="flex gap-2">
-              {plannedRoute.length > 0 && (
-                <button 
-                  onClick={async () => {
-                    setIsReviewing(true);
-                    try {
-                      await fetchRoute(true);
-                      setAssignDate(selectedDate);
-                      setShowReviewModal(true);
-                    } finally {
-                      setIsReviewing(false);
-                    }
-                  }}
-                  disabled={isReviewing}
-                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg transition-all text-xs font-bold flex items-center gap-1 disabled:opacity-50"
-                >
-                  {isReviewing ? <Sparkles className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
-                  {isReviewing ? 'Loading...' : 'Review & Confirm'}
-                </button>
-              )}
-              {isRouteConfirmed && (
-                <button 
-                  onClick={() => {
-                    setActiveTab('CALENDAR');
-                    setIsRescheduling(selectedDate);
-                  }}
-                  className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg transition-all text-blue-400"
-                  title="Reschedule Route"
-                >
-                  <ArrowRightLeft className="w-4 h-4" />
-                </button>
-              )}
-              {plannedRoute.length > 2 && (
-                <button 
-                  onClick={optimizeRoute}
-                  disabled={isOptimizing}
-                  className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg transition-all text-blue-400 disabled:opacity-50"
-                  title="Optimize Route"
-                >
-                  <Filter className={cn("w-4 h-4", isOptimizing && "animate-spin")} />
-                </button>
-              )}
-              <button 
-                onClick={async () => {
-                  if (confirm("Are you sure you want to clear the entire route for today?")) {
-                    setPlannedRoute([]);
-                    setStartPoint(HOME_LOCATION as Location);
-                    setEndPoint(HOME_LOCATION as Location);
-                    if (user) {
-                      const q = query(
-                        collection(db, `users/${user.uid}/plannedRoutes`),
-                        where('date', '==', selectedDate)
-                      );
-                      const snapshot = await getDocs(q);
-                      if (!snapshot.empty) {
-                        await deleteDoc(doc(db, `users/${user.uid}/plannedRoutes`, snapshot.docs[0].id));
-                      }
-                    }
-                  }
-                }}
-                className="p-1.5 bg-neutral-800 hover:bg-red-900/40 rounded-lg transition-all text-red-400"
-                title="Clear Route"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-              <span className="bg-blue-600 px-2 py-0.5 rounded text-xs font-bold">
-                {plannedRoute.length} STOPS
-              </span>
-            </div>
-          </div>
-          
-          <div className="space-y-3 max-h-96 overflow-y-auto pr-2 custom-scrollbar">
-            <AnimatePresence mode="popLayout">
-              {/* Start Point */}
-              <motion.div 
-                key="start-point"
-                layout
-                className="flex items-center gap-3 mb-2 p-2 bg-neutral-50 rounded-xl border border-neutral-100"
-              >
-                <div className="w-6 h-6 rounded-full bg-neutral-900 border border-neutral-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
-                  1
+          {activeTab === 'OFFLINE' && (
+            <div className="space-y-6">
+              <div className="flex items-center justify-between px-2">
+                <h3 className="text-sm font-bold uppercase tracking-widest text-neutral-400">Offline Map Management</h3>
+                <div className={cn(
+                  "flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-bold uppercase",
+                  offlineStatus === 'online' ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                )}>
+                  <div className={cn("w-1.5 h-1.5 rounded-full", offlineStatus === 'online' ? "bg-green-500" : "bg-red-500")} />
+                  {offlineStatus}
                 </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs font-bold truncate">{startPoint?.address || 'Home'}</p>
-                  <div className={cn(
-                    "flex items-center gap-2 text-[10px]",
-                    calculateETA(0).isOverdue ? "text-red-500 font-bold" : "text-neutral-500"
-                  )}>
-                    <div className="flex items-center gap-1">
-                      <Clock className="w-3 h-3 text-blue-500" />
-                      <span>Dep: {calculateETA(0).departure}</span>
-                    </div>
-                    {calculateETA(0).isOverdue && (
-                      <div className="flex items-center gap-1 text-red-500 animate-pulse">
-                        <AlertCircle className="w-3 h-3" />
-                        <span>Overdue</span>
-                      </div>
-                    )}
-                  </div>
+              </div>
+
+              {planningAlert && (
+                <div className="mx-2 p-4 bg-amber-50 border border-amber-200 rounded-2xl flex gap-3 text-amber-800">
+                  <AlertCircle className="w-5 h-5 shrink-0" />
+                  <p className="text-xs font-medium leading-relaxed">{planningAlert}</p>
                 </div>
-                {startPoint?.id !== 'HOME' && (
-                  <div className="flex items-center gap-1 bg-neutral-100 px-2 py-1 rounded-lg">
-                    <input 
-                      type="number" 
-                      value={startPoint.visitDuration || visitDuration} 
-                      onChange={(e) => updateLocationDuration(startPoint.id, parseInt(e.target.value) || 0)}
-                      className="w-8 bg-transparent text-[10px] font-bold text-center outline-none"
-                    />
-                    <span className="text-[8px] font-bold text-neutral-400 uppercase">min</span>
+              )}
+
+              <div className="mx-2 p-6 bg-blue-600 rounded-3xl text-white relative overflow-hidden group">
+                <div className="relative z-10">
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="p-2 bg-white/20 rounded-xl">
+                      <Download className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h4 className="text-sm font-bold">Download New Area</h4>
+                      <p className="text-[10px] opacity-70">Save maps for disconnected travel</p>
+                    </div>
                   </div>
-                )}
-                {startPoint?.id !== 'HOME' && (
-                  <button onClick={() => setStartPoint(HOME_LOCATION as Location)} className="text-[10px] text-blue-600 font-bold hover:underline">Reset</button>
-                )}
-              </motion.div>
 
-              {plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, index) => (
-                <motion.div key={loc.id} layout>
-                  {routeStats[index] && (
-                    <div className="flex items-center gap-2 ml-3 py-1 border-l border-dashed border-neutral-700 pl-4">
-                      <div className="flex flex-col text-[9px] text-neutral-500 font-bold uppercase tracking-tighter">
-                        <span>{(routeStats[index].distance * 0.000621371).toFixed(1)} mi</span>
-                        <span>{Math.round(routeStats[index].duration / 60)} min drive</span>
+                  {!isDownloading ? (
+                    <div className="grid grid-cols-2 gap-2">
+                      <button 
+                         onClick={() => {
+                           setDrawingMode('polygon');
+                           setDrawPoints([]);
+                           setActiveTab('PLANNER'); // Switch to map view
+                         }}
+                         className="py-3 bg-white/10 hover:bg-white/20 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 border border-white/20"
+                      >
+                        <SquareIcon className="w-4 h-4" />
+                        Select Area
+                      </button>
+                      <button 
+                         onClick={handleDownloadArea}
+                         disabled={drawPoints.length < 3 && !drawCircle}
+                         className="py-3 bg-white text-blue-600 rounded-xl text-xs font-bold transition-all disabled:opacity-50 flex items-center justify-center gap-2 shadow-lg"
+                      >
+                        <CloudDownload className="w-4 h-4" />
+                        Download
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <div className="flex justify-between items-center text-[10px] font-bold uppercase tracking-wider">
+                        <span>Downloading Tiles...</span>
+                        <span>{downloadProgress}%</span>
                       </div>
-                    </div>
-                  )}
-                  <motion.div 
-                    initial={{ opacity: 0, x: -20 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    exit={{ opacity: 0, scale: 0.95 }}
-                    className="flex items-center gap-3 group p-2 hover:bg-neutral-50 rounded-xl transition-all"
-                  >
-                    <div className="w-6 h-6 rounded-full bg-blue-500/20 border border-blue-500/50 flex items-center justify-center text-[10px] font-bold text-blue-400 shrink-0">
-                      {index + 2}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs font-medium truncate leading-tight">{loc.address}</p>
-                      <div className={cn(
-                        "flex items-center gap-2 text-[10px] mt-0.5",
-                        calculateETA(index + 1).isOverdue ? "text-red-500" : "text-neutral-500"
-                      )}>
-                        <div className="flex items-center gap-1">
-                          <Clock className="w-3 h-3" />
-                          <span className="font-bold">Arr: {calculateETA(index + 1).arrival}</span>
-                        </div>
-                        <div className="w-0.5 h-0.5 rounded-full bg-neutral-300" />
-                        <div className="flex items-center gap-1">
-                          <span>Dep: {calculateETA(index + 1).departure}</span>
-                        </div>
-                        {calculateETA(index + 1).isOverdue && (
-                          <div className="flex items-center gap-1 font-bold animate-pulse">
-                            <AlertCircle className="w-3 h-3" />
-                            <span>Overdue</span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-1 bg-neutral-100 px-2 py-1 rounded-lg">
-                      <input 
-                        type="number" 
-                        value={loc.visitDuration || visitDuration} 
-                        onChange={(e) => updateLocationDuration(loc.id, parseInt(e.target.value) || 0)}
-                        className="w-8 bg-transparent text-[10px] font-bold text-center outline-none"
-                      />
-                      <span className="text-[8px] font-bold text-neutral-400 uppercase">min</span>
-                    </div>
-                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
-                      <button 
-                        onClick={() => moveInRoute(index, 'up')}
-                        disabled={index === 0}
-                        className="p-1 text-neutral-400 hover:text-blue-500 disabled:opacity-30"
-                      >
-                        <ChevronUp className="w-3 h-3" />
-                      </button>
-                      <button 
-                        onClick={() => moveInRoute(index, 'down')}
-                        disabled={index === plannedRoute.length - 1}
-                        className="p-1 text-neutral-400 hover:text-blue-500 disabled:opacity-30"
-                      >
-                        <ChevronDown className="w-3 h-3" />
-                      </button>
-                      <button 
-                        onClick={() => setStartPoint(loc)}
-                        className="p-1 text-neutral-400 hover:text-green-500"
-                        title="Set as Start"
-                      >
-                        <Navigation className="w-3 h-3" />
-                      </button>
-                      <button 
-                        onClick={() => setEndPoint(loc)}
-                        className="p-1 text-neutral-400 hover:text-red-500"
-                        title="Set as End"
-                      >
-                        <MapPin className="w-3 h-3" />
-                      </button>
-                      <button 
-                        onClick={() => removeFromRoute(loc.id)}
-                        className="p-1 text-neutral-400 hover:text-red-400"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </motion.div>
-                </motion.div>
-              ))}
-
-              {/* End Point */}
-              {plannedRoute.length > 0 && (
-                <motion.div key="end-point" layout>
-                  {routeStats[plannedRoute.length] && (
-                    <div className="flex items-center gap-2 ml-3 py-1 border-l border-dashed border-neutral-700 pl-4">
-                      <div className="flex flex-col text-[9px] text-neutral-500 font-bold uppercase tracking-tighter">
-                        <span>{(routeStats[plannedRoute.length].distance * 0.000621371).toFixed(1)} mi</span>
-                        <span>{Math.round(routeStats[plannedRoute.length].duration / 60)} min drive</span>
-                      </div>
-                    </div>
-                  )}
-                  <div className="flex items-center gap-3 mt-2 p-2 bg-neutral-50 rounded-xl border border-neutral-100">
-                    <div className="w-6 h-6 rounded-full bg-neutral-900 border border-neutral-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
-                      {plannedRoute.length + 2}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs font-bold truncate">{endPoint?.address || 'End Point'}</p>
-                      <div className={cn(
-                        "flex items-center gap-2 text-[10px] mt-0.5",
-                        calculateETA(plannedRoute.length + 1).isOverdue ? "text-red-500 font-bold" : "text-neutral-500"
-                      )}>
-                        <div className="flex items-center gap-1">
-                          <Clock className="w-3 h-3" />
-                          <span>Arr: {calculateETA(plannedRoute.length + 1).arrival}</span>
-                        </div>
-                        {calculateETA(plannedRoute.length + 1).isOverdue && (
-                          <div className="flex items-center gap-1 text-red-500 animate-pulse">
-                            <AlertCircle className="w-3 h-3" />
-                            <span>Overdue</span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                    {endPoint?.id !== 'HOME' && (
-                      <div className="flex items-center gap-1 bg-neutral-100 px-2 py-1 rounded-lg">
-                        <input 
-                          type="number" 
-                          value={endPoint.visitDuration || visitDuration} 
-                          onChange={(e) => updateLocationDuration(endPoint.id, parseInt(e.target.value) || 0)}
-                          className="w-8 bg-transparent text-[10px] font-bold text-center outline-none"
+                      <div className="h-2 bg-white/20 rounded-full overflow-hidden">
+                        <motion.div 
+                          className="h-full bg-white" 
+                          initial={{ width: 0 }}
+                          animate={{ width: `${downloadProgress}%` }}
                         />
-                        <span className="text-[8px] font-bold text-neutral-400 uppercase">min</span>
                       </div>
-                    )}
-                    {endPoint?.id !== 'HOME' && (
-                      <button onClick={() => setEndPoint(HOME_LOCATION as Location)} className="text-[10px] text-blue-600 font-bold hover:underline">Reset</button>
-                    )}
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-            {plannedRoute.length === 0 && (
-              <p className="text-xs text-neutral-500 italic py-4 text-center">No locations added to route yet.</p>
-            )}
-          </div>
+                    </div>
+                  )}
+                </div>
+                <div className="absolute -right-8 -bottom-8 opacity-10 blur-xl">
+                  <MapIcon className="w-40 h-40" />
+                </div>
+              </div>
 
-          {plannedRoute.length > 0 && (
-            <div className="flex gap-2 mt-6">
-              {!isNavigating ? (
-                <button 
-                  onClick={fetchRoute}
-                  className="flex-1 py-3 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-lg shadow-blue-900/20"
-                >
-                  <Navigation className="w-4 h-4" />
-                  Start Route
-                </button>
-              ) : (
-                <button 
-                  onClick={completeRoute}
-                  className="flex-1 py-3 bg-green-600 hover:bg-green-500 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-lg shadow-green-900/20"
-                >
-                  <CheckCircle2 className="w-4 h-4" />
-                  Complete & Save
-                </button>
-              )}
+              <div className="space-y-4">
+                <div className="flex items-center justify-between px-2">
+                  <h4 className="text-xs font-bold text-neutral-500 uppercase tracking-wider">Management Console</h4>
+                  <div className="flex items-center gap-1 text-[10px] text-neutral-400 font-medium">
+                    <Database className="w-3 h-3" />
+                    <span>{offlineAreas.length} Areas Saved</span>
+                  </div>
+                </div>
+                
+                <div className="space-y-3 px-2">
+                  {offlineAreas.length === 0 ? (
+                    <div className="text-center py-12 bg-neutral-50 rounded-[32px] border-2 border-dashed border-neutral-100">
+                      <div className="w-12 h-12 bg-white rounded-2xl shadow-sm flex items-center justify-center mx-auto mb-4 border border-neutral-100">
+                        <WifiOff className="w-6 h-6 text-neutral-300" />
+                      </div>
+                      <h5 className="text-sm font-bold text-neutral-800">No Offline Maps</h5>
+                      <p className="text-[10px] text-neutral-400 max-w-[180px] mx-auto mt-2 leading-relaxed">
+                        Download specific areas to use the planner and maps without an internet connection.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 gap-3">
+                      {offlineAreas.map(area => (
+                        <motion.div 
+                          key={area.id} 
+                          layout
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          className="bg-white border border-neutral-100 rounded-[28px] overflow-hidden shadow-sm hover:shadow-md transition-all group"
+                        >
+                          <div className="p-4 flex items-center justify-between">
+                            <div className="flex items-center gap-4">
+                              <div className="w-12 h-12 bg-blue-50 rounded-2xl flex items-center justify-center text-blue-500 group-hover:bg-blue-600 group-hover:text-white transition-all">
+                                <MapIcon className="w-6 h-6" />
+                              </div>
+                              <div className="min-w-0">
+                                <h5 className="text-sm font-bold text-neutral-800 truncate">{area.name}</h5>
+                                <div className="flex items-center gap-2 mt-1">
+                                  <span className="text-[9px] font-black text-neutral-400 uppercase tracking-tighter bg-neutral-50 px-1.5 py-0.5 rounded">
+                                    {area.sizeMB} MB
+                                  </span>
+                                  <span className="text-[9px] font-medium text-neutral-500">
+                                    {new Date(area.date).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                            
+                            <button 
+                              onClick={() => handleDeleteArea(area.id)}
+                              className="p-3 bg-neutral-50 hover:bg-red-50 text-neutral-400 hover:text-red-500 rounded-2xl transition-all"
+                              title="Delete Area"
+                            >
+                              <Trash className="w-4 h-4" />
+                            </button>
+                          </div>
+                          
+                          <div className="px-4 pb-4 flex items-center justify-between border-t border-neutral-50 pt-3">
+                            <div className="flex items-center gap-4">
+                              <div className="flex flex-col">
+                                <span className="text-[8px] font-bold text-neutral-400 uppercase tracking-widest">Tiles</span>
+                                <span className="text-xs font-bold text-neutral-700">{area.tileCount.toLocaleString()}</span>
+                              </div>
+                              <div className="flex flex-col">
+                                <span className="text-[8px] font-bold text-neutral-400 uppercase tracking-widest">Levels</span>
+                                <span className="text-xs font-bold text-neutral-700">{area.zoomRange[0]}-{area.zoomRange[1]}</span>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1 text-[10px] text-green-600 font-bold">
+                              <CheckCircle2 className="w-3 h-3" />
+                              <span>Ready</span>
+                            </div>
+                          </div>
+                        </motion.div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="mx-2 p-4 bg-neutral-50 rounded-2xl border border-neutral-100 flex gap-3 text-neutral-500">
+                <Info className="w-4 h-4 shrink-0" />
+                <p className="text-[10px] leading-relaxed italic">
+                  Note: Offline map data is stored locally in your browser. Clearing your browser cache may remove these maps.
+                </p>
+              </div>
             </div>
           )}
         </div>
+
+        {/* Planned Route Summary */}
+        <motion.div 
+          initial={false}
+          animate={{ height: isRouteSummaryMinimized ? '72px' : '550px' }}
+          className={cn(
+            "bg-neutral-900 text-white shrink-0 relative overflow-hidden transition-all duration-300 flex flex-col",
+            isRouteSummaryMinimized ? "h-[72px] shadow-[0_-8px_30px_rgb(0,0,0,0.5)] border-t border-neutral-800" : "h-[550px]"
+          )}
+        >
+          <div className="p-6 pb-2 relative z-10 shrink-0">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Calendar className="w-5 h-5 text-blue-400" />
+                <div className="flex flex-col">
+                  <h2 className="font-bold text-sm">Today's Route</h2>
+                  {isRouteSummaryMinimized && (
+                    <p className="text-[10px] text-neutral-400 font-bold uppercase tracking-widest leading-none mt-0.5">
+                      {plannedRoute.length} Stops • {Math.round(routeStats.reduce((acc, curr) => acc + curr.distance, 0) * 0.000621371)} Mi
+                    </p>
+                  )}
+                </div>
+                {isRouteConfirmed && !isRouteSummaryMinimized && (
+                  <span className="ml-2 px-2 py-0.5 bg-green-500/20 text-green-400 text-[10px] font-bold rounded uppercase tracking-wider flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3" />
+                    Confirmed
+                  </span>
+                )}
+                {planningAlert && !isRouteSummaryMinimized && (
+                  <div className="ml-2 group relative">
+                    <AlertCircle className="w-5 h-5 text-amber-500 animate-pulse cursor-help" />
+                    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-48 p-2 bg-neutral-800 border border-neutral-700 text-[9px] rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50">
+                      {planningAlert}
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button 
+                  onClick={() => setIsRouteSummaryMinimized(!isRouteSummaryMinimized)}
+                  className="p-1.5 hover:bg-white/10 rounded-lg transition-all text-neutral-400 hover:text-white"
+                  title={isRouteSummaryMinimized ? "Expand Dashboard" : "Minimize Dashboard"}
+                >
+                  {isRouteSummaryMinimized ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <AnimatePresence mode="wait">
+            {!isRouteSummaryMinimized && (
+              <motion.div
+                key="summary-expanded"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="flex-1 overflow-hidden flex flex-col px-6 pb-6 relative z-10"
+              >
+                <div className="space-y-4 mb-4">
+                  <div className="flex gap-2">
+                    {plannedRoute.length > 0 && (
+                      <button 
+                        onClick={async () => {
+                          setIsReviewing(true);
+                          try {
+                            await fetchRoute(true);
+                            setAssignDate(selectedDate);
+                            setShowReviewModal(true);
+                          } finally {
+                            setIsReviewing(false);
+                          }
+                        }}
+                        disabled={isReviewing}
+                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg transition-all text-xs font-bold flex items-center gap-1 disabled:opacity-50"
+                      >
+                        {isReviewing ? <Sparkles className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+                        {isReviewing ? 'Loading...' : 'Review & Confirm'}
+                      </button>
+                    )}
+                    {isRouteConfirmed && (
+                      <button 
+                        onClick={() => {
+                          setActiveTab('CALENDAR');
+                          setIsRescheduling(selectedDate);
+                        }}
+                        className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg transition-all text-blue-400"
+                        title="Reschedule Route"
+                      >
+                        <ArrowRightLeft className="w-4 h-4" />
+                      </button>
+                    )}
+                    {plannedRoute.length > 2 && (
+                      <button 
+                        onClick={optimizeRoute}
+                        disabled={isOptimizing}
+                        className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg transition-all text-purple-400 disabled:opacity-50"
+                        title="Optimize Sequence"
+                      >
+                        <Sparkles className={cn("w-4 h-4", isOptimizing && "animate-spin")} />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-3 bg-white/5 rounded-2xl border border-white/10">
+                      <p className="text-[9px] font-bold text-neutral-500 uppercase tracking-widest mb-1">Total Distance</p>
+                      <p className="text-xl font-bold">
+                        {(routeStats.reduce((acc, curr) => acc + curr.distance, 0) * 0.000621371).toFixed(1)}
+                        <span className="ml-1 text-[10px] text-neutral-500">mi</span>
+                      </p>
+                    </div>
+                    <div className="p-3 bg-white/5 rounded-2xl border border-white/10">
+                      <p className="text-[9px] font-bold text-neutral-500 uppercase tracking-widest mb-1">Travel Time</p>
+                      <p className="text-xl font-bold">
+                        {Math.round(routeStats.reduce((acc, curr) => acc + curr.duration, 0) / 60)}
+                        <span className="ml-1 text-[10px] text-neutral-500">min</span>
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto pr-1 custom-scrollbar space-y-3">
+                  <AnimatePresence mode="popLayout">
+                    {/* Start Point */}
+                    <motion.div 
+                      key="start-point"
+                      layout
+                      className="flex items-center gap-3 mb-2 p-2 bg-white/5 rounded-xl border border-white/10"
+                    >
+                      <div className="w-6 h-6 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
+                        1
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-bold truncate text-white">{startPoint?.address || 'Home'}</p>
+                        <div className={cn(
+                          "flex items-center gap-2 text-[10px]",
+                          calculateETA(0).isOverdue ? "text-red-400 font-bold" : "text-neutral-400"
+                        )}>
+                          <div className="flex items-center gap-1">
+                            <Clock className="w-3 h-3 text-blue-400" />
+                            <span>Dep: {calculateETA(0).departure}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </motion.div>
+
+                    {plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, index) => (
+                      <motion.div key={loc.id} layout>
+                        <motion.div 
+                          className="flex items-center gap-3 group p-2 hover:bg-white/5 rounded-xl transition-all border border-transparent hover:border-white/10"
+                        >
+                          <div className="w-6 h-6 rounded-full bg-blue-500/20 border border-blue-500/50 flex items-center justify-center text-[10px] font-bold text-blue-400 shrink-0">
+                            {index + 2}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs font-medium truncate leading-tight text-white">{loc.address}</p>
+                            <div className={cn(
+                              "flex items-center gap-2 text-[10px] mt-0.5",
+                              calculateETA(index + 1).isOverdue ? "text-red-400" : "text-neutral-400"
+                            )}>
+                              <div className="flex items-center gap-1 text-blue-400">
+                                <Clock className="w-3 h-3" />
+                                <span className="font-bold">Arr: {calculateETA(index + 1).arrival}</span>
+                              </div>
+                            </div>
+                          </div>
+                          <button 
+                            onClick={() => removeFromRoute(loc.id)}
+                            className="p-1.5 text-neutral-500 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </motion.div>
+                      </motion.div>
+                    ))}
+
+                    {/* End Point */}
+                    {plannedRoute.length > 0 && (
+                      <motion.div 
+                        key="end-point" 
+                        layout 
+                        className="flex items-center gap-3 mt-2 p-2 bg-white/5 rounded-xl border border-white/10"
+                      >
+                        <div className="w-6 h-6 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
+                          {plannedRoute.length + 2}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-bold truncate text-white">{endPoint?.address || 'End Point'}</p>
+                          <div className={cn(
+                            "flex items-center gap-2 text-[10px] mt-0.5",
+                            calculateETA(plannedRoute.length + 1).isOverdue ? "text-red-400 font-bold" : "text-neutral-400"
+                          )}>
+                            <div className="flex items-center gap-1 text-blue-400">
+                              <Clock className="w-3 h-3" />
+                              <span>Arr: {calculateETA(plannedRoute.length + 1).arrival}</span>
+                            </div>
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+
+                {plannedRoute.length > 0 && (
+                  <div className="flex gap-2 mt-4 shrink-0">
+                    {!isNavigating ? (
+                      <button 
+                        onClick={fetchRoute}
+                        className="flex-1 py-3 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-lg shadow-blue-900/20"
+                      >
+                        <Navigation className="w-4 h-4" />
+                        Start Route
+                      </button>
+                    ) : (
+                      <button 
+                        onClick={completeRoute}
+                        className="flex-1 py-3 bg-green-600 hover:bg-green-500 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-lg shadow-green-900/20"
+                      >
+                        <CheckCircle2 className="w-4 h-4" />
+                        Complete & Save
+                      </button>
+                    )}
+                  </div>
+                )}
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Background accent */}
+          {!isRouteSummaryMinimized && (
+            <div className="absolute -right-20 -bottom-20 w-64 h-64 bg-blue-600/10 blur-[100px] pointer-events-none" />
+          )}
+        </motion.div>
       </div>
 
       {/* Navigation Instructions Overlay */}
@@ -2121,7 +2472,7 @@ export default function App() {
           className="h-full w-full"
           zoomControl={false}
         >
-          <TileLayer
+          <OfflineTileLayer
             attribution={
               mapLayer === 'satellite' 
                 ? 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EBP, and the GIS User Community'
@@ -2136,7 +2487,43 @@ export default function App() {
                 ? "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png"
                 : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
             }
+            activeLayer={mapLayer}
           />
+
+          {showTrafficLayer && (
+            <TileLayer
+              attribution="Google Maps Traffic"
+              url="https://mt1.google.com/vt?lyrs=h@159000000,traffic|seconds_into_week:-1&style=3&x={x}&y={y}&z={z}"
+              opacity={0.65}
+              zIndex={100}
+            />
+          )}
+
+          {showTrafficLayer && trafficIncidents.map((incident, idx) => (
+            <Marker 
+              key={`incident-${idx}`} 
+              position={[incident.lat, incident.lng]}
+              icon={L.divIcon({
+                className: 'traffic-incident-icon',
+                html: `<div class="bg-red-500 text-white p-1 rounded-full border-2 border-white shadow-lg animate-pulse">
+                  <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                    <line x1="12" y1="9" x2="12" y2="13"></line>
+                    <line x1="12" y1="17" x2="12" y2="17.01"></line>
+                  </svg>
+                </div>`
+              })}
+            >
+              <Popup className="incident-popup">
+                <div className="p-2">
+                  <p className="text-xs font-bold text-red-600 mb-1 flex items-center gap-1">
+                    <AlertCircle className="w-3 h-3" /> Major Incident
+                  </p>
+                  <p className="text-[10px] font-medium text-neutral-800 leading-tight">{incident.description}</p>
+                </div>
+              </Popup>
+            </Marker>
+          ))}
           
           <MapUpdater center={centerPosition} zoom={mapZoom} />
           
