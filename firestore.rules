@@ -36,6 +36,11 @@
 //   - duration: number (required)
 //   - timestamp: timestamp (required)
 //
+// Collection: users/{uid}/locationSettings
+// Document ID: {locationId}
+// Fields:
+//   - visitDuration: number (optional)
+
 // ===============================================================
 
 rules_version = '2';
@@ -92,6 +97,10 @@ service cloud.firestore {
              data.timestamp is timestamp;
     }
 
+    function isValidLocationSetting(data) {
+      return (!('visitDuration' in data) || (data.visitDuration is number && data.visitDuration >= 0));
+    }
+
     // ===============================================================
     // Rules
     // ===============================================================
@@ -112,6 +121,13 @@ service cloud.firestore {
         allow read: if isOwner(userId);
         allow create: if isOwner(userId) && isValidHistory(request.resource.data);
         allow update: if isOwner(userId) && isValidHistory(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+
+      match /locationSettings/{locationId} {
+        allow get, list: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidLocationSetting(request.resource.data);
+        allow update: if isOwner(userId) && isValidLocationSetting(request.resource.data);
         allow delete: if isOwner(userId);
       }
     }

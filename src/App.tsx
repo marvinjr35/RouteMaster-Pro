@@ -37,6 +37,8 @@ import {
   GripVertical,
   AlertCircle,
   Download,
+  Share2,
+  FileText,
   WifiOff,
   Database,
   Trash
@@ -186,7 +188,7 @@ function DrawingLayer({
         <>
           <Polygon positions={points} pathOptions={{ color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.2, weight: 2 }} />
           {points.map((p, i) => (
-            <Circle key={i} center={p} radius={5} pathOptions={{ color: '#3b82f6', fillColor: '#fff', fillOpacity: 1, weight: 2 }} />
+            <Circle key={`draw-point-${i}`} center={p} radius={5} pathOptions={{ color: '#3b82f6', fillColor: '#fff', fillOpacity: 1, weight: 2 }} />
           ))}
         </>
       )}
@@ -241,6 +243,87 @@ export default function App() {
   const [showTrafficLayer, setShowTrafficLayer] = useState(false);
   const [trafficAlerts, setTrafficAlerts] = useState<string[]>([]);
   const [trafficMultiplier, setTrafficMultiplier] = useState(1.0);
+  const [trafficIncidents, setTrafficIncidents] = useState<{description: string, lat: number, lng: number}[]>([]);
+  const [plannedRoute, setPlannedRoute] = useState<Location[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filterCarrier, setFilterCarrier] = useState<string | 'ALL'>('ALL');
+  const [selectedLocation, setSelectedLocation] = useState<Location | null>(null);
+  const [isNavigating, setIsNavigating] = useState(false);
+  const [instructions, setInstructions] = useState<any[]>([]);
+  const [routeGeometry, setRouteGeometry] = useState<[number, number][]>([]);
+  const [routeStats, setRouteStats] = useState<{ distance: number; duration: number }[]>([]);
+  const [isOptimizing, setIsOptimizing] = useState(false);
+  const [isReviewing, setIsReviewing] = useState(false);
+  const [showOnlyClosest, setShowOnlyClosest] = useState(true);
+  const [activeTab, setActiveTab] = useState<'PLANNER' | 'VISITED' | 'HISTORY' | 'ANALYTICS' | 'CALENDAR' | 'OFFLINE'>('PLANNER');
+  const [confirmedPlannedStoreIds, setConfirmedPlannedStoreIds] = useState<Set<string>>(new Set());
+  const [routeHistory, setRouteHistory] = useState<any[]>([]);
+  const visitedStoreIds = useMemo(() => {
+    const ids = new Set<string>(confirmedPlannedStoreIds);
+    routeHistory.forEach(entry => {
+      if (entry.stopIds) {
+        entry.stopIds.forEach((id: string) => ids.add(id));
+      }
+      if (entry.startPointId && entry.startPointId !== 'HOME') ids.add(entry.startPointId);
+      if (entry.endPointId && entry.endPointId !== 'HOME') ids.add(entry.endPointId);
+    });
+    return ids;
+  }, [confirmedPlannedStoreIds, routeHistory]);
+  const [isTracking, setIsTracking] = useState(false);
+  const [trackingStartTime, setTrackingStartTime] = useState<number | null>(null);
+  const [startTime, setStartTime] = useState('10:00');
+  const [endTime, setEndTime] = useState('18:00');
+  const [visitDuration, setVisitDuration] = useState(40);
+  const [startPoint, setStartPoint] = useState<Location>(HOME_LOCATION as Location);
+  const [endPoint, setEndPoint] = useState<Location>(HOME_LOCATION as Location);
+  const [avoidTolls, setAvoidTolls] = useState(false);
+  const [avoidTraffic, setAvoidTraffic] = useState(false);
+  const [showGasStations, setShowGasStations] = useState(false);
+  const [gasStations, setGasStations] = useState<any[]>([]);
+  const [isLoadingGas, setIsLoadingGas] = useState(false);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [mapLayer, setMapLayer] = useState<'standard' | 'satellite' | 'terrain'>('standard');
+  const [showLayerMenu, setShowLayerMenu] = useState(false);
+  const [drawingMode, setDrawingMode] = useState<'polygon' | 'circle' | null>(null);
+  const [drawPoints, setDrawPoints] = useState<[number, number][]>([]);
+  const [drawCircle, setDrawCircle] = useState<{ center: [number, number], radius: number } | null>(null);
+  const [showReviewModal, setShowReviewModal] = useState(false);
+  const [assignDate, setAssignDate] = useState(selectedDate);
+  const [isRouteConfirmed, setIsRouteConfirmed] = useState(false);
+  const [expandedCluster, setExpandedCluster] = useState<string | null>(null);
+  const [showCalendar, setShowCalendar] = useState(false);
+  const [offlineAreas, setOfflineAreas] = useState<OfflineArea[]>([]);
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [offlineStatus, setOfflineStatus] = useState<'online' | 'offline'>('online');
+  const [planningAlert, setPlanningAlert] = useState<string | null>(null);
+  const [isRouteSummaryMinimized, setIsRouteSummaryMinimized] = useState(false);
+  const [locationSettings, setLocationSettings] = useState<Record<string, { visitDuration?: number }>>({});
+
+  const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+    const R = 3958.8; // Miles
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+              Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const dC = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * dC;
+  };
+
+  const sortedLocations = useMemo(() => {
+    // Ensure absolute uniqueness of the source locations list
+    const uniqueMap = new Map<string, Location>();
+    locations.forEach(loc => {
+      if (loc && loc.id) uniqueMap.set(loc.id, loc);
+    });
+    const uniqueLocations = Array.from(uniqueMap.values());
+
+    return uniqueLocations.map(loc => ({
+      ...loc,
+      distanceFromHome: calculateDistance(HOME_LOCATION.lat, HOME_LOCATION.lng, loc.lat, loc.lng)
+    })).sort((a, b) => a.distanceFromHome - b.distanceFromHome);
+  }, []);
 
   // Auth Listener
   useEffect(() => {
@@ -263,8 +346,12 @@ export default function App() {
     const unsubscribe = onSnapshot(q, (snapshot) => {
       if (!snapshot.empty) {
         const data = snapshot.docs[0].data();
-        const stops = data.stops.map((id: string) => locations.find(l => l.id === id)).filter(Boolean);
-        setPlannedRoute(stops);
+        const stops = data.stops.map((id: string) => locations.find(l => l.id === id)).filter((s: Location | undefined): s is Location => !!s);
+        // Ensure uniqueness to avoid duplicate key errors
+        const uniqueStops = Array.from(new Set(stops.map(s => s.id)))
+          .map(id => stops.find(s => s.id === id))
+          .filter((s): s is Location => !!s);
+        setPlannedRoute(uniqueStops);
         setIsRouteConfirmed(data.isConfirmed || false);
         if (data.startPointId) {
           const sp = locations.find(l => l.id === data.startPointId) || HOME_LOCATION;
@@ -292,7 +379,11 @@ export default function App() {
     const q = collection(db, `users/${user.uid}/history`);
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const history = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setRouteHistory(history.sort((a: any, b: any) => b.timestamp?.seconds - a.timestamp?.seconds));
+      // Ensure local uniqueness
+      const uniqueHistoryMap = new Map();
+      history.forEach((h: any) => uniqueHistoryMap.set(h.id, h));
+      const uniqueHistory = Array.from(uniqueHistoryMap.values());
+      setRouteHistory(uniqueHistory.sort((a: any, b: any) => b.timestamp?.seconds - a.timestamp?.seconds));
     }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/history`));
 
     return () => unsubscribe();
@@ -320,6 +411,22 @@ export default function App() {
       });
       setConfirmedPlannedStoreIds(ids);
     }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/plannedRoutes`));
+
+    return () => unsubscribe();
+  }, [user, isAuthReady]);
+
+  // Firestore Sync: Location Settings
+  useEffect(() => {
+    if (!user || !isAuthReady) return;
+
+    const q = collection(db, `users/${user.uid}/locationSettings`);
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const settings: Record<string, { visitDuration?: number }> = {};
+      snapshot.docs.forEach(doc => {
+        settings[doc.id] = doc.data() as { visitDuration?: number };
+      });
+      setLocationSettings(settings);
+    }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${user.uid}/locationSettings`));
 
     return () => unsubscribe();
   }, [user, isAuthReady]);
@@ -475,7 +582,64 @@ export default function App() {
     }
   };
 
-  const [trafficIncidents, setTrafficIncidents] = useState<{description: string, lat: number, lng: number}[]>([]);
+  const shareRoute = () => {
+    const routeData = {
+      date: selectedDate,
+      stops: plannedRoute.map(s => s.id),
+      start: startPoint?.id,
+      end: endPoint?.id
+    };
+    const encoded = btoa(JSON.stringify(routeData));
+    const url = `${window.location.origin}${window.location.pathname}?route=${encoded}`;
+    
+    navigator.clipboard.writeText(url);
+    alert('Shareable link copied to clipboard!');
+  };
+
+  const exportRouteSummary = () => {
+    const fullRoute = [startPoint, ...plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id), endPoint].filter(Boolean);
+    const totalMiles = routeStats.reduce((acc, curr) => acc + curr.distance * 0.000621371, 0);
+    const totalDuration = routeStats.reduce((acc, curr) => acc + curr.duration, 0) / 60;
+
+    let content = `ROUTE SUMMARY - ${selectedDate}\n`;
+    content += `====================================\n`;
+    content += `Total Distance: ${totalMiles.toFixed(2)} miles\n`;
+    content += `Total Travel Time: ${Math.round(totalDuration)} minutes\n`;
+    content += `Traffic Multiplier: ${trafficMultiplier.toFixed(1)}x\n\n`;
+    content += `STOPS:\n`;
+
+    fullRoute.forEach((stop, i) => {
+      const eta = calculateETA(i);
+      content += `${i + 1}. ${stop.name || stop.address}\n`;
+      content += `   Arrival: ${eta.arrival}\n`;
+      content += `   Departure: ${eta.departure}\n`;
+      if (eta.isOverdue) content += `   ⚠️ ARRIVAL AFTER BUSINESS HOURS\n`;
+      content += `   Address: ${stop.address}\n\n`;
+    });
+
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `route-summary-${selectedDate}.txt`;
+    link.click();
+  };
+
+  const handleReorder = async (newOrder: Location[]) => {
+    setPlannedRoute(newOrder);
+    // Automatically update route geometry when reordered
+    if (user) await savePlannedRoute(newOrder, startPoint, endPoint);
+  };
+
+  useEffect(() => {
+    // If plannedRoute changes via reordering or adding/removing, refresh the geometry
+    if (plannedRoute.length > 0) {
+      const timer = setTimeout(() => {
+        fetchRoute(true);
+      }, 500); // Debounce to allow multiple reorders
+      return () => clearTimeout(timer);
+    }
+  }, [plannedRoute.map(l => l.id).join(',')]);
   const fetchTrafficData = async () => {
     try {
       const prompt = `What are the current traffic conditions and any major accidents or delays in the Washington DC area right now? 
@@ -533,60 +697,43 @@ export default function App() {
     if (user) await savePlannedRoute(newRoute, startPoint, endPoint);
   };
 
-  const [plannedRoute, setPlannedRoute] = useState<Location[]>([]);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [filterCarrier, setFilterCarrier] = useState<string | 'ALL'>('ALL');
-  const [selectedLocation, setSelectedLocation] = useState<Location | null>(null);
-  const [isNavigating, setIsNavigating] = useState(false);
-  const [instructions, setInstructions] = useState<any[]>([]);
-  const [routeGeometry, setRouteGeometry] = useState<[number, number][]>([]);
-  const [routeStats, setRouteStats] = useState<{ distance: number; duration: number }[]>([]);
-  const [isOptimizing, setIsOptimizing] = useState(false);
-  const [isReviewing, setIsReviewing] = useState(false);
-  const [showOnlyClosest, setShowOnlyClosest] = useState(true);
-  const [activeTab, setActiveTab] = useState<'PLANNER' | 'VISITED' | 'HISTORY' | 'ANALYTICS' | 'CALENDAR' | 'OFFLINE'>('PLANNER');
-  const [confirmedPlannedStoreIds, setConfirmedPlannedStoreIds] = useState<Set<string>>(new Set());
-  const [routeHistory, setRouteHistory] = useState<any[]>([]);
-  const visitedStoreIds = useMemo(() => {
-    const ids = new Set<string>(confirmedPlannedStoreIds);
-    routeHistory.forEach(entry => {
-      if (entry.stopIds) {
-        entry.stopIds.forEach((id: string) => ids.add(id));
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const routeParam = params.get('route');
+    if (routeParam) {
+      try {
+        const decoded = JSON.parse(atob(routeParam));
+        if (decoded.date) setSelectedDate(decoded.date);
+        
+        if (decoded.stops) {
+          const loadedStops = decoded.stops.map((id: string) => {
+            if (id === 'HOME') return HOME_LOCATION as Location;
+            return locations.find(l => l.id === id);
+          }).filter(Boolean);
+          // Ensure uniqueness to avoid duplicate key errors
+          const uniqueLoadedStops = Array.from(new Set(loadedStops.map((s: any) => s.id)))
+            .map(id => loadedStops.find((s: any) => s.id === id))
+            .filter((s): s is Location => !!s);
+          setPlannedRoute(uniqueLoadedStops);
+        }
+        
+        if (decoded.start) {
+          const sp = decoded.start === 'HOME' ? (HOME_LOCATION as Location) : locations.find(l => l.id === decoded.start);
+          if (sp) setStartPoint(sp);
+        }
+        
+        if (decoded.end) {
+          const ep = decoded.end === 'HOME' ? (HOME_LOCATION as Location) : locations.find(l => l.id === decoded.end);
+          if (ep) setEndPoint(ep);
+        }
+        
+        setActiveTab('PLANNER');
+      } catch (e) {
+        console.error('Failed to parse shared route', e);
       }
-      if (entry.startPointId && entry.startPointId !== 'HOME') ids.add(entry.startPointId);
-      if (entry.endPointId && entry.endPointId !== 'HOME') ids.add(entry.endPointId);
-    });
-    return ids;
-  }, [confirmedPlannedStoreIds, routeHistory]);
-  const [isTracking, setIsTracking] = useState(false);
-  const [trackingStartTime, setTrackingStartTime] = useState<number | null>(null);
-  const [startTime, setStartTime] = useState('10:00');
-  const [endTime, setEndTime] = useState('18:00');
-  const [visitDuration, setVisitDuration] = useState(40);
-  const [startPoint, setStartPoint] = useState<Location>(HOME_LOCATION as Location);
-  const [endPoint, setEndPoint] = useState<Location>(HOME_LOCATION as Location);
-  const [avoidTolls, setAvoidTolls] = useState(false);
-  const [avoidTraffic, setAvoidTraffic] = useState(false);
-  const [showGasStations, setShowGasStations] = useState(false);
-  const [gasStations, setGasStations] = useState<any[]>([]);
-  const [isLoadingGas, setIsLoadingGas] = useState(false);
-  const [showClearConfirm, setShowClearConfirm] = useState(false);
-  const [mapLayer, setMapLayer] = useState<'standard' | 'satellite' | 'terrain'>('standard');
-  const [showLayerMenu, setShowLayerMenu] = useState(false);
-  const [drawingMode, setDrawingMode] = useState<'polygon' | 'circle' | null>(null);
-  const [drawPoints, setDrawPoints] = useState<[number, number][]>([]);
-  const [drawCircle, setDrawCircle] = useState<{ center: [number, number], radius: number } | null>(null);
-  const [showReviewModal, setShowReviewModal] = useState(false);
-  const [assignDate, setAssignDate] = useState(selectedDate);
-  const [isRouteConfirmed, setIsRouteConfirmed] = useState(false);
-  const [expandedCluster, setExpandedCluster] = useState<string | null>(null);
-  const [showCalendar, setShowCalendar] = useState(false);
-  const [offlineAreas, setOfflineAreas] = useState<OfflineArea[]>([]);
-  const [isDownloading, setIsDownloading] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState(0);
-  const [offlineStatus, setOfflineStatus] = useState<'online' | 'offline'>('online');
-  const [planningAlert, setPlanningAlert] = useState<string | null>(null);
-  const [isRouteSummaryMinimized, setIsRouteSummaryMinimized] = useState(false);
+    }
+  }, []);
 
   useEffect(() => {
     const loadAreas = async () => {
@@ -879,16 +1026,16 @@ export default function App() {
               const padding = Array.from({ length: firstDay }, (_, i) => null);
 
               return (
-                <div key={name} className="space-y-4">
+                <div key={`month-${name}`} className="space-y-4">
                   <h3 className="text-xl font-bold text-neutral-800 px-2">{name}</h3>
                   <div className="grid grid-cols-7 gap-2">
                     {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => (
-                      <div key={d} className="text-center text-[10px] font-black text-neutral-400 uppercase tracking-widest py-2">
+                      <div key={`weekday-${d}`} className="text-center text-[10px] font-black text-neutral-400 uppercase tracking-widest py-2">
                         {d}
                       </div>
                     ))}
                     {[...padding, ...days].map((day, i) => {
-                      if (day === null) return <div key={`pad-${i}`} />;
+                      if (day === null) return <div key={`pad-${name}-${i}`} />;
                       
                       const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                       const isWorking = workingDays.includes(dateStr);
@@ -925,7 +1072,7 @@ export default function App() {
                               <span className="text-[8px] font-black uppercase opacity-80">{route.stops.length} Stores</span>
                               <div className="flex gap-0.5 mt-0.5">
                                 {route.stops.slice(0, 3).map((_: any, idx: number) => (
-                                  <div key={idx} className="w-1 h-1 rounded-full bg-white/60" />
+                                  <div key={`dot-${dateStr}-${idx}`} className="w-1 h-1 rounded-full bg-white/60" />
                                 ))}
                               </div>
                             </div>
@@ -1001,31 +1148,13 @@ export default function App() {
   // Clustering logic: Group by City/Area
   const clusters = useMemo(() => {
     const groups: Record<string, Location[]> = {};
-    locations.forEach(loc => {
-      const area = loc.city;
+    sortedLocations.forEach(loc => {
+      const area = loc.city || 'Unknown';
       if (!groups[area]) groups[area] = [];
       groups[area].push(loc);
     });
     return groups;
-  }, []);
-
-  const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-    const R = 3958.8; // Miles
-    const dLat = (lat2 - lat1) * Math.PI / 180;
-    const dLon = (lon2 - lon1) * Math.PI / 180;
-    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-              Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-  };
-
-  const sortedLocations = useMemo(() => {
-    return [...locations].map(loc => ({
-      ...loc,
-      distanceFromHome: calculateDistance(HOME_LOCATION.lat, HOME_LOCATION.lng, loc.lat, loc.lng)
-    })).sort((a, b) => a.distanceFromHome - b.distanceFromHome);
-  }, []);
+  }, [sortedLocations]);
 
   const filteredLocations = useMemo(() => {
     const date = new Date(selectedDate + 'T00:00:00');
@@ -1053,8 +1182,8 @@ export default function App() {
   }, [searchQuery, filterCarrier, selectedDate, showOnlyClosest, sortedLocations, visitedStoreIds]);
 
   const visitedLocations = useMemo(() => {
-    return locations.filter(loc => visitedStoreIds.has(loc.id));
-  }, [locations, visitedStoreIds]);
+    return sortedLocations.filter(loc => visitedStoreIds.has(loc.id));
+  }, [sortedLocations, visitedStoreIds]);
 
   const optimizeRoute = async () => {
     if (plannedRoute.length < 1) return;
@@ -1259,6 +1388,17 @@ export default function App() {
     setOfflineAreas(prev => prev.filter(a => a.id !== id));
   };
 
+  const updateLocationVisitDuration = async (locationId: string, duration: number) => {
+    if (!user) return;
+    try {
+      await setDoc(doc(db, `users/${user.uid}/locationSettings`, locationId), {
+        visitDuration: duration
+      }, { merge: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}/locationSettings/${locationId}`);
+    }
+  };
+
   const calculateETA = (index: number) => {
     const [startH, startM] = (startTime || '10:00').split(':').map(Number);
     const [endH, endM] = (endTime || '18:00').split(':').map(Number);
@@ -1274,7 +1414,7 @@ export default function App() {
 
       // If the stop we are leaving (i) is NOT home, we spend time there BEFORE leaving
       if (currentStop.id !== 'HOME') {
-        const duration = (currentStop.visitDuration || visitDuration) * 60;
+        const duration = (locationSettings[currentStop.id]?.visitDuration || currentStop.visitDuration || visitDuration) * 60;
         totalSeconds += duration;
       }
 
@@ -1289,7 +1429,7 @@ export default function App() {
     const arrivalTime = new Date(start.getTime() + totalSeconds * 1000);
     
     // Departure time is arrival time + visit duration (if not Home)
-    const currentVisitDuration = (fullRoute[index]?.visitDuration || visitDuration) * 60;
+    const currentVisitDuration = (locationSettings[fullRoute[index]?.id]?.visitDuration || fullRoute[index]?.visitDuration || visitDuration) * 60;
     const departureTime = new Date(arrivalTime.getTime() + (fullRoute[index]?.id !== 'HOME' ? currentVisitDuration : 0));
     
     const end = new Date();
@@ -1327,7 +1467,7 @@ export default function App() {
       // Mock prices since real-time gas prices are not available via free public API
       // We'll use a realistic range for DC area (e.g., $3.40 - $3.90)
       const stations = data.elements.map((el: any) => ({
-        id: el.id,
+        id: String(el.id),
         lat: el.lat,
         lng: el.lon,
         name: el.tags.name || 'Gas Station',
@@ -1335,7 +1475,12 @@ export default function App() {
         price: (3.4 + Math.random() * 0.5).toFixed(2)
       }));
       
-      setGasStations(stations);
+      // Ensure absolute uniqueness
+      const uniqueStationsMap = new Map();
+      stations.forEach((s: any) => uniqueStationsMap.set(s.id, s));
+      const uniqueStations = Array.from(uniqueStationsMap.values());
+      
+      setGasStations(uniqueStations);
     } catch (error) {
       console.error('Error fetching gas stations:', error);
     } finally {
@@ -1726,7 +1871,7 @@ export default function App() {
                             Live Traffic Insights
                           </p>
                           {trafficAlerts.map((alert, i) => (
-                            <p key={i} className="text-[9px] text-blue-600 leading-tight">• {alert}</p>
+                            <p key={`traffic-alert-${i}-${alert.substring(0, 10)}`} className="text-[9px] text-blue-600 leading-tight">• {alert}</p>
                           ))}
                         </div>
                       )}
@@ -1754,7 +1899,7 @@ export default function App() {
                   <div className="flex gap-2 overflow-x-auto pb-2 custom-scrollbar">
                     {gasStations.map(station => (
                       <div 
-                        key={station.id}
+                        key={`gas-station-sidebar-${station.id}`}
                         className="min-w-[140px] p-3 bg-green-50 rounded-2xl border border-green-100 flex flex-col gap-1"
                       >
                         <p className="text-[10px] font-bold text-green-700 truncate">{station.name}</p>
@@ -1787,7 +1932,7 @@ export default function App() {
               {filteredLocations.map((loc) => (
                 <motion.div
                   layout
-                  key={loc.id}
+                  key={`filtered-${loc.id}`}
                   onClick={() => setSelectedLocation(loc)}
                   className={cn(
                     "group relative p-4 rounded-2xl border transition-all cursor-pointer",
@@ -1835,9 +1980,22 @@ export default function App() {
                     )}
                   </div>
                   <h3 className="font-semibold text-sm mb-1">{loc.address}</h3>
-                  <div className="flex items-center gap-1 text-xs text-neutral-500">
-                    <MapPin className="w-3 h-3" />
-                    <span>{loc.city}, {loc.state}</span>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1 text-xs text-neutral-500">
+                      <MapPin className="w-3 h-3" />
+                      <span>{loc.city}, {loc.state}</span>
+                    </div>
+                    <div className="flex items-center gap-1 bg-neutral-100 rounded-lg px-2 py-1" onClick={(e) => e.stopPropagation()}>
+                      <Clock className="w-3 h-3 text-neutral-400" />
+                      <input 
+                        type="number"
+                        value={locationSettings[loc.id]?.visitDuration || loc.visitDuration || visitDuration}
+                        onChange={(e) => updateLocationVisitDuration(loc.id, parseInt(e.target.value) || 0)}
+                        className="w-8 bg-transparent text-[10px] font-bold text-neutral-700 focus:outline-none text-center"
+                        min="1"
+                      />
+                      <span className="text-[9px] text-neutral-400">min</span>
+                    </div>
                   </div>
                 </motion.div>
               ))}
@@ -1856,7 +2014,7 @@ export default function App() {
               <div className="space-y-3">
                 {visitedLocations.map((loc) => (
                   <div 
-                    key={loc.id}
+                    key={`visited-${loc.id}`}
                     className="p-4 bg-neutral-50 border border-neutral-100 rounded-2xl flex items-center gap-4"
                   >
                     <div className="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center shrink-0">
@@ -1897,7 +2055,7 @@ export default function App() {
                 </button>
               </div>
               {routeHistory.map(route => (
-                <div key={route.id} className="p-4 bg-white border border-neutral-200 rounded-2xl">
+                <div key={`history-${route.id}`} className="p-4 bg-white border border-neutral-200 rounded-2xl">
                   <div className="flex justify-between items-center mb-2">
                     <span className="text-xs font-bold text-neutral-400">{route.date}</span>
                     <span className="text-[10px] font-bold bg-blue-50 text-blue-600 px-2 py-0.5 rounded uppercase">
@@ -1955,7 +2113,11 @@ export default function App() {
                       contentStyle={{ borderRadius: '16px', border: 'none', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)' }}
                       labelStyle={{ fontWeight: 'bold', fontSize: '12px' }}
                     />
-                    <Bar dataKey="miles" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+                    <Bar dataKey="miles" fill="#3b82f6" radius={[4, 4, 0, 0]}>
+                      {routeHistory.slice().reverse().map((entry, index) => (
+                        <Cell key={`bar-cell-${entry.id || 'idx'}-${index}`} fill={index % 2 === 0 ? '#3b82f6' : '#60a5fa'} />
+                      ))}
+                    </Bar>
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -1964,7 +2126,7 @@ export default function App() {
                 <h4 className="text-xs font-bold text-neutral-500 uppercase px-2">Store Clusters</h4>
                 <div className="grid grid-cols-1 gap-2 px-2">
                   {(Object.entries(clusters) as [string, Location[]][]).sort((a, b) => b[1].length - a[1].length).slice(0, 8).map(([area, stores]) => (
-                    <div key={area} className="space-y-2">
+                    <div key={`cluster-${area}`} className="space-y-2">
                       <div 
                         onClick={() => setExpandedCluster(expandedCluster === area ? null : area)}
                         className={cn(
@@ -1995,7 +2157,7 @@ export default function App() {
                             <div className="bg-white border border-neutral-100 rounded-xl p-2 space-y-1 ml-2">
                               {stores.map(store => (
                                 <div 
-                                  key={store.id}
+                                  key={`cluster-store-${store.id}`}
                                   onClick={() => {
                                     setActiveTab('PLANNER');
                                   }}
@@ -2118,7 +2280,7 @@ export default function App() {
                     <div className="grid grid-cols-1 gap-3">
                       {offlineAreas.map(area => (
                         <motion.div 
-                          key={area.id} 
+                          key={`offline-${area.id}`} 
                           layout
                           initial={{ opacity: 0, y: 10 }}
                           animate={{ opacity: 1, y: 0 }}
@@ -2284,6 +2446,20 @@ export default function App() {
                         <Sparkles className={cn("w-4 h-4", isOptimizing && "animate-spin")} />
                       </button>
                     )}
+                    <button 
+                      onClick={exportRouteSummary}
+                      className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg transition-all text-neutral-400 hover:text-white"
+                      title="Export Text Summary"
+                    >
+                      <FileText className="w-4 h-4" />
+                    </button>
+                    <button 
+                      onClick={shareRoute}
+                      className="p-1.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg transition-all text-neutral-400 hover:text-white"
+                      title="Copy Shareable Link"
+                    >
+                      <Share2 className="w-4 h-4" />
+                    </button>
                   </div>
 
                   <div className="grid grid-cols-2 gap-3">
@@ -2307,9 +2483,8 @@ export default function App() {
                 <div className="flex-1 overflow-y-auto pr-1 custom-scrollbar space-y-3">
                   <AnimatePresence mode="popLayout">
                     {/* Start Point */}
-                    <motion.div 
-                      key="start-point"
-                      layout
+                    <div 
+                      key="planner-sidebar-start"
                       className="flex items-center gap-3 mb-2 p-2 bg-white/5 rounded-xl border border-white/10"
                     >
                       <div className="w-6 h-6 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
@@ -2325,45 +2500,72 @@ export default function App() {
                             <Clock className="w-3 h-3 text-blue-400" />
                             <span>Dep: {calculateETA(0).departure}</span>
                           </div>
+                          {calculateETA(0).isOverdue && <span className="flex items-center gap-1"><AlertCircle className="w-3 h-3" /> Overdue</span>}
                         </div>
                       </div>
-                    </motion.div>
+                    </div>
 
-                    {plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, index) => (
-                      <motion.div key={loc.id} layout>
-                        <motion.div 
-                          className="flex items-center gap-3 group p-2 hover:bg-white/5 rounded-xl transition-all border border-transparent hover:border-white/10"
+                    <Reorder.Group axis="y" values={plannedRoute} onReorder={handleReorder} className="space-y-3">
+                      {plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, index) => (
+                        <Reorder.Item 
+                          key={`reorder-${loc.id}`} 
+                          value={loc}
+                          initial={{ opacity: 0, x: -10 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          exit={{ opacity: 0, x: 10 }}
+                          className="relative"
                         >
-                          <div className="w-6 h-6 rounded-full bg-blue-500/20 border border-blue-500/50 flex items-center justify-center text-[10px] font-bold text-blue-400 shrink-0">
-                            {index + 2}
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <p className="text-xs font-medium truncate leading-tight text-white">{loc.address}</p>
-                            <div className={cn(
-                              "flex items-center gap-2 text-[10px] mt-0.5",
-                              calculateETA(index + 1).isOverdue ? "text-red-400" : "text-neutral-400"
-                            )}>
-                              <div className="flex items-center gap-1 text-blue-400">
-                                <Clock className="w-3 h-3" />
-                                <span className="font-bold">Arr: {calculateETA(index + 1).arrival}</span>
+                          <div 
+                            className="flex items-center gap-3 group p-2 bg-neutral-900 border border-white/5 hover:bg-white/5 rounded-xl transition-all hover:border-white/10"
+                          >
+                            <div className="flex flex-col items-center gap-1">
+                              <GripVertical className="w-4 h-4 text-neutral-600 cursor-grab active:cursor-grabbing" />
+                              <div className="w-6 h-6 rounded-full bg-blue-500/20 border border-blue-500/50 flex items-center justify-center text-[10px] font-bold text-blue-400 shrink-0">
+                                {index + 2}
                               </div>
                             </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-medium truncate leading-tight text-white">{loc.name || loc.address}</p>
+                              <div className={cn(
+                                "flex items-center flex-wrap gap-x-3 gap-y-1 text-[10px] mt-1",
+                                calculateETA(index + 1).isOverdue ? "text-red-400 font-bold" : "text-neutral-400"
+                              )}>
+                                <div className="flex items-center gap-1 text-blue-400 font-bold">
+                                  <Clock className="w-3 h-3" />
+                                  <span>Arr: {calculateETA(index + 1).arrival}</span>
+                                </div>
+                                <div className="flex items-center gap-1 opacity-80">
+                                  <span>Dep: {calculateETA(index + 1).departure}</span>
+                                </div>
+                                <div className="flex items-center gap-1 bg-white/5 rounded px-1.5 py-0.5 border border-white/5">
+                                  <Clock className="w-2.5 h-2.5 text-neutral-500" />
+                                  <input 
+                                    type="number"
+                                    value={locationSettings[loc.id]?.visitDuration || loc.visitDuration || visitDuration}
+                                    onChange={(e) => updateLocationVisitDuration(loc.id, parseInt(e.target.value) || 0)}
+                                    className="w-7 bg-transparent text-[10px] font-bold text-white focus:outline-none text-center"
+                                    min="1"
+                                  />
+                                  <span className="text-[8px] text-neutral-500 uppercase">min</span>
+                                </div>
+                                {calculateETA(index + 1).isOverdue && <span className="flex items-center gap-1 bg-red-400/10 px-1 rounded"><AlertCircle className="w-2.5 h-2.5" /> OVERDUE</span>}
+                              </div>
+                            </div>
+                            <button 
+                              onClick={() => removeFromRoute(loc.id)}
+                              className="p-1.5 text-neutral-500 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
                           </div>
-                          <button 
-                            onClick={() => removeFromRoute(loc.id)}
-                            className="p-1.5 text-neutral-500 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </motion.div>
-                      </motion.div>
-                    ))}
+                        </Reorder.Item>
+                      ))}
+                    </Reorder.Group>
 
                     {/* End Point */}
                     {plannedRoute.length > 0 && (
-                      <motion.div 
-                        key="end-point" 
-                        layout 
+                      <div 
+                        key="planner-sidebar-end"
                         className="flex items-center gap-3 mt-2 p-2 bg-white/5 rounded-xl border border-white/10"
                       >
                         <div className="w-6 h-6 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
@@ -2379,9 +2581,10 @@ export default function App() {
                               <Clock className="w-3 h-3" />
                               <span>Arr: {calculateETA(plannedRoute.length + 1).arrival}</span>
                             </div>
+                            {calculateETA(plannedRoute.length + 1).isOverdue && <span className="flex items-center gap-1"><AlertCircle className="w-3 h-3" /> Overdue</span>}
                           </div>
                         </div>
-                      </motion.div>
+                      </div>
                     )}
                   </AnimatePresence>
                 </div>
@@ -2442,7 +2645,7 @@ export default function App() {
             </div>
             <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
               {instructions.map((step, i) => (
-                <div key={i} className="flex gap-3 pb-4 border-b border-neutral-100 last:border-0">
+                <div key={`instruction-${i}-${step.instruction.substring(0, 10)}`} className="flex gap-3 pb-4 border-b border-neutral-100 last:border-0">
                   <div className="w-6 h-6 rounded-full bg-neutral-100 flex items-center justify-center text-[10px] font-bold text-neutral-500 shrink-0">
                     {i + 1}
                   </div>
@@ -2501,7 +2704,7 @@ export default function App() {
 
           {showTrafficLayer && trafficIncidents.map((incident, idx) => (
             <Marker 
-              key={`incident-${idx}`} 
+              key={`traffic-incident-${idx}-${incident.lat}-${incident.lng}`} 
               position={[incident.lat, incident.lng]}
               icon={L.divIcon({
                 className: 'traffic-incident-icon',
@@ -2535,11 +2738,11 @@ export default function App() {
             setCircle={setDrawCircle} 
           />
 
-          <Marker position={[HOME_LOCATION.lat, HOME_LOCATION.lng]} icon={homeIcon} />
+          <Marker key="marker-home" position={[HOME_LOCATION.lat, HOME_LOCATION.lng]} icon={homeIcon} />
 
           {showGasStations && gasStations.map((station) => (
             <Marker 
-              key={station.id} 
+              key={`gas-station-${station.id}`} 
               position={[station.lat, station.lng]}
               icon={L.divIcon({
                 className: 'custom-div-icon',
@@ -2573,7 +2776,7 @@ export default function App() {
               
               return (
                 <Marker 
-                  key={loc.id} 
+                  key={`marker-store-${loc.id}-${isVisited ? 'v' : 'nv'}-${isInRoute ? 'r' : 'nr'}`} 
                   position={[loc.lat, loc.lng]}
                   icon={createMarkerIcon(
                     color, 
@@ -2817,7 +3020,7 @@ export default function App() {
                     onReorder={setPlannedRoute}
                     className="max-h-[300px] overflow-y-auto space-y-2 pr-2 custom-scrollbar p-1"
                   >
-                    <div className="flex items-center gap-3 p-3 bg-blue-50/50 border border-blue-100 rounded-2xl mb-2">
+                    <div key="start-point-static" className="flex items-center gap-3 p-3 bg-blue-50/50 border border-blue-100 rounded-2xl mb-2">
                       <div className="w-6 h-6 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white shrink-0 shadow-lg shadow-blue-600/20">1</div>
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-semibold truncate text-neutral-800">{startPoint?.address || 'Start Point'}</p>
@@ -2825,9 +3028,9 @@ export default function App() {
                       </div>
                     </div>
 
-                    {plannedRoute.map((loc, i) => (
+                    {plannedRoute.filter(l => l && l?.id !== startPoint?.id && l?.id !== endPoint?.id).map((loc, i) => (
                       <Reorder.Item 
-                        key={loc.id} 
+                        key={`modal-reorder-${loc.id}`} 
                         value={loc}
                         onDragEnd={async () => {
                           if (user) await savePlannedRoute(plannedRoute, startPoint, endPoint);
@@ -2889,7 +3092,7 @@ export default function App() {
                       </Reorder.Item>
                     ))}
 
-                    <div className="flex items-center gap-3 p-3 bg-blue-50/50 border border-blue-100 rounded-2xl mt-2">
+                    <div key="end-point-static" className="flex items-center gap-3 p-3 bg-blue-50/50 border border-blue-100 rounded-2xl mt-2">
                       <div className="w-6 h-6 rounded-full bg-blue-600 flex items-center justify-center text-[10px] font-bold text-white shrink-0 shadow-lg shadow-blue-600/20">
                         {plannedRoute.length + 2}
                       </div>
@@ -2965,7 +3168,7 @@ export default function App() {
                     </div>
                   )}
                   {chatMessages.map((msg, i) => (
-                    <div key={i} className={cn(
+                    <div key={`chat-msg-${i}-${msg.role}`} className={cn(
                       "max-w-[80%] p-3 rounded-2xl text-sm",
                       msg.role === 'user' ? "ml-auto bg-blue-600 text-white" : "bg-neutral-100 text-neutral-800"
                     )}>

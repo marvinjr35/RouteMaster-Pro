@@ -2,13 +2,13 @@ import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-export const geminiFlash = (prompt: string, systemInstruction?: string) => {
+export const geminiFlash = (prompt: string, systemInstruction?: string, useMaps = true) => {
   return ai.models.generateContent({
     model: "gemini-3-flash-preview",
     contents: prompt,
     config: {
       systemInstruction,
-      tools: [{ googleSearch: {} }, { googleMaps: {} }],
+      tools: useMaps ? [{ googleMaps: {} }] : [{ googleSearch: {} }],
       toolConfig: { includeServerSideToolInvocations: true }
     }
   });

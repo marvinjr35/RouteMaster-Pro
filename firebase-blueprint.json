@@ -49,6 +49,14 @@
         "timestamp": { "type": "string", "format": "date-time" }
       },
       "required": ["uid", "date", "miles", "duration"]
+    },
+    "LocationSetting": {
+      "title": "Location Setting",
+      "description": "Per-location settings like visit duration override.",
+      "type": "object",
+      "properties": {
+        "visitDuration": { "type": "number" }
+      }
     }
   },
   "firestore": {
@@ -63,6 +71,10 @@
     "/users/{uid}/history/{historyId}": {
       "schema": "RouteHistory",
       "description": "Completed route history for a user"
+    },
+    "/users/{uid}/locationSettings/{locationId}": {
+      "schema": "LocationSetting",
+      "description": "Per-location user settings"
     }
   }
 }
